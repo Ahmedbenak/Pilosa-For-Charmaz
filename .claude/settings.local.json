@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-Command *)",
+      "PowerShell(wsl --status 2>&1 | Select-Object -First 5)",
+      "PowerShell($gitBash = @\\(\"C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe\", \"C:\\\\Program Files\\\\Git\\\\usr\\\\bin\\\\bash.exe\", \"C:\\\\Git\\\\bin\\\\bash.exe\"\\) | Where-Object { Test-Path $_ } | Select-Object -First 1; if \\($gitBash\\) { Write-Output \"Found: $gitBash\" } else { Write-Output \"Git Bash not found\" })"
+    ]
+  }
+}

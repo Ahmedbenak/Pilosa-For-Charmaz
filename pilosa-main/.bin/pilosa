@@ -1,0 +1,3929 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── pilosa — CLI entry point ────────────────────────────────────────────────
+# Usage: pilosa [new|onboard|update|check|sync|uninstall|help]
+#
+# Commands:
+#   new       Create a new Pilosa workspace and run onboarding
+#   onboard   Run onboarding on an existing workspace
+#   update    Update workspace framework files from a release
+#   check     Validate workspace integrity and configuration
+#   sync      Sync agent and skill mirrors from canonical sources
+#   uninstall Remove Pilosa from this system
+#   help      Show this help
+
+# ── ANSI colors (zero dependencies) ─────────────────────────────────────────
+if [[ "${NO_COLOR:-}" == "1" ]] || [[ ! -t 1 ]]; then
+  R="" G="" B="" Y="" C="" M="" DIM="" BOLD="" RESET=""
+else
+  R=$'\033[31m' G=$'\033[32m' B=$'\033[34m' Y=$'\033[33m'
+  C=$'\033[36m' M=$'\033[35m' DIM=$'\033[2m' BOLD=$'\033[1m' RESET=$'\033[0m'
+fi
+
+# ── paths ───────────────────────────────────────────────────────────────────
+PILOSA_HOME="${PILOSA_HOME:-$HOME/.pilosa}"
+PILOSA_REPO="${PILOSA_REPO:-TommasoPrinetti/pilosa}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TODAY="$(date +%Y-%m-%d)"
+USE_GUM="${USE_GUM:-0}"
+
+# ── global cleanup trap ────────────────────────────────────────────────────
+cleanup_on_exit() {
+  # Kill spinner if running
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+  fi
+  # Reset terminal
+  stty sane 2>/dev/null || true
+}
+
+trap cleanup_on_exit EXIT INT TERM
+
+# Source file classes used by integrated onboarding.
+MARKDOWN_EXTENSIONS="txt|rtf|textile|wiki|mediawiki|dokuwiki|pmwiki|outliner|workflowy|dynalist"
+NATIVE_EXTENSIONS="md|csv|json|yaml|yml|toml|xml|html|css|js|ts|py|rb|sh|log|ini|cfg|conf|tex|bib|org|adoc|rst|tiddlywiki|logseq|roam|obsidian"
+BINARY_COPYABLE_EXTENSIONS=""
+OPTION_SEP=$'\t'
+
+# Resolve framework root:
+#   - Dev mode: binary is in .bin/ of the repo → FRAMEWORK_ROOT is repo root
+#   - Installed mode: binary is in ~/.pilosa/bin/ → framework is in ~/.pilosa/versions/<latest>/
+resolve_framework_root() {
+  # Dev mode: check if we're in the repo's .bin/
+  local candidate="${SCRIPT_DIR}/.."
+  if [[ -f "${candidate}/.pilosa/framework-files.tsv" ]]; then
+    echo "$candidate"
+    return
+  fi
+
+  # Installed mode: find latest version
+  if [[ -d "${PILOSA_HOME}/versions" ]]; then
+      local latest_version
+      local portable_sort
+      if sort -V /dev/null 2>/dev/null; then
+        portable_sort="sort -V"
+      else
+        portable_sort="sort -t. -k1,1n -k2,2n -k3,3n"
+      fi
+      latest_version="$(ls -1 "${PILOSA_HOME}/versions" 2>/dev/null | $portable_sort | tail -1)"
+    if [[ -n "$latest_version" ]]; then
+      local fw_dir="${PILOSA_HOME}/versions/${latest_version}"
+      # The archive unpacks to pilosa-framework-<version>/
+      local fw_subdir
+      fw_subdir="$(find "$fw_dir" -maxdepth 1 -type d -name 'pilosa-framework-*' 2>/dev/null | head -1)"
+      if [[ -n "$fw_subdir" && -f "${fw_subdir}/.pilosa/framework-files.tsv" ]]; then
+        echo "$fw_subdir"
+        return
+      fi
+    fi
+  fi
+
+  echo ""
+}
+
+FRAMEWORK_ROOT="$(resolve_framework_root)"
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+divider()   { printf '%s\n' "${DIM}$(printf '%.0s─' 1 {1..78})${RESET}"; }
+header()    { printf '\n%s\n\n' "${BOLD}${C}$1${RESET}"; }
+info()      { printf '  %s %s\n' "${DIM}→${RESET}" "$1"; }
+ok()        { printf '  %s %s\n' "${G}✦${RESET}" "$1"; }
+warn()      { printf '  %s %s\n' "${Y}⚠${RESET}" "$1"; }
+note()      { printf '  %s↳%s %s\n' "${DIM}" "${RESET}" "$1"; }
+die()       { printf '\n  %s %s\n\n' "${R}✗${RESET}" "$1" >&2; exit 1; }
+print_step(){ printf '\n  %s%s[%s/%s] %s%s\n' "${BOLD}" "${C}" "$1" "$2" "$3" "${RESET}"; }
+
+read_from_tty() {
+  if [[ -t 0 ]]; then
+    IFS= read -r "$@"
+  else
+    # Try to read from /dev/tty if available, suppress all errors
+    { [[ -r /dev/tty ]] && IFS= read -r "$@" < /dev/tty; } 2>/dev/null || return 1
+  fi
+}
+
+spinner_start() {
+  local msg="$1"
+  SPINNER_PID=""
+  [[ -t 1 ]] || return 0
+  (
+    local frames=("▁" "▃" "▄" "▅" "▆" "▇" "█" "▇" "▆" "▅" "▄" "▃")
+    local i=0
+    while true; do
+      printf '\r\033[2K  %s%s%s %s' "${C}" "${frames[$((i % 12))]}" "${RESET}" "$msg" >&2
+      i=$((i + 1))
+      sleep 0.1
+    done
+  ) &
+  SPINNER_PID=$!
+}
+
+spinner_stop() {
+  [[ -n "${SPINNER_PID:-}" ]] || return 0
+  kill "$SPINNER_PID" 2>/dev/null || true
+  wait "$SPINNER_PID" 2>/dev/null || true
+  SPINNER_PID=""
+  printf '\r\033[2K' >&2
+}
+
+gum_available() {
+  [[ "$USE_GUM" == "1" && -t 0 ]] || return 1
+  local bin
+  if [[ -x "${PILOSA_HOME}/bin/gum" ]]; then
+    bin="${PILOSA_HOME}/bin/gum"
+  else
+    bin="$(command -v gum 2>/dev/null)" || return 1
+  fi
+  # Verify gum can actually open a TTY
+  "$bin" --version >/dev/null 2>&1 || return 1
+  return 0
+}
+
+gum_bin() {
+  if [[ -x "${PILOSA_HOME}/bin/gum" ]]; then
+    echo "${PILOSA_HOME}/bin/gum"
+  else
+    command -v gum 2>/dev/null
+  fi
+}
+
+gum_input() {
+  local prompt="$1" value="${2:-}" bin
+  bin="$(gum_bin)" || return 127
+  "$bin" input --placeholder "$prompt" --value "$value"
+}
+
+gum_file() {
+  local title="$1" bin
+  bin="$(gum_bin)" || return 127
+  "$bin" file --directory --title "$title"
+}
+
+gum_choose() {
+  local prompt="$1" bin
+  shift
+  bin="$(gum_bin)" || return 127
+  "$bin" choose --header "$prompt" "$@"
+}
+
+gum_multi_choose() {
+  local prompt="$1" selected_csv="$2" bin
+  shift 2
+  bin="$(gum_bin)" || return 127
+  if [[ -n "$selected_csv" ]]; then
+    "$bin" choose --header "$prompt" --no-limit --ordered --selected="$selected_csv" "$@"
+  else
+    "$bin" choose --header "$prompt" --no-limit --ordered "$@"
+  fi
+}
+
+gum_confirm() {
+  local prompt="$1" bin
+  bin="$(gum_bin)" || return 127
+  "$bin" confirm "$prompt"
+}
+
+prompt_input() {
+  local prompt="$1" default="${2:-}" hint="${3:-}" value=""
+  if gum_available; then
+    value="$(gum_input "$prompt" "$default" 2>/dev/null)" || value=""
+    reset_terminal
+  fi
+  if [[ -z "$value" ]]; then
+    value="$(ask "$prompt" "$default" "$hint")"
+  fi
+  echo "$value"
+}
+
+prompt_directory() {
+  local prompt="$1" default="${2:-}" hint="${3:-}" value=""
+  if gum_available; then
+    value="$(gum_file "$prompt" 2>/dev/null)" || value=""
+    reset_terminal
+  fi
+  if [[ -z "$value" ]]; then
+    value="$(ask "$prompt" "$default" "$hint")"
+  fi
+  echo "$value"
+}
+
+option_spec() {
+  local value="$1" label="${2:-$1}" description="${3:-}"
+  printf '%s%s%s%s%s' "$value" "$OPTION_SEP" "$label" "$OPTION_SEP" "$description"
+}
+
+option_value() {
+  local spec="$1"
+  if [[ "$spec" == *"$OPTION_SEP"* ]]; then
+    printf '%s' "${spec%%"$OPTION_SEP"*}"
+  else
+    printf '%s' "$spec"
+  fi
+}
+
+option_rest() {
+  local spec="$1"
+  if [[ "$spec" == *"$OPTION_SEP"* ]]; then
+    printf '%s' "${spec#*"$OPTION_SEP"}"
+  else
+    printf ''
+  fi
+}
+
+option_label() {
+  local rest label
+  rest="$(option_rest "$1")"
+  if [[ "$rest" == *"$OPTION_SEP"* ]]; then
+    label="${rest%%"$OPTION_SEP"*}"
+    printf '%s' "${label:-$(option_value "$1")}"
+  elif [[ -n "$rest" ]]; then
+    printf '%s' "$rest"
+  else
+    printf '%s' "$(option_value "$1")"
+  fi
+}
+
+option_description() {
+  local rest
+  rest="$(option_rest "$1")"
+  if [[ "$rest" == *"$OPTION_SEP"* ]]; then
+    printf '%s' "${rest#*"$OPTION_SEP"}"
+  else
+    printf ''
+  fi
+}
+
+option_display() {
+  local spec="$1" selected="${2:-0}" label desc
+  label="$(option_label "$spec")"
+  desc="$(option_description "$spec")"
+  if [[ -n "$desc" ]]; then
+    if [[ "$selected" == "1" ]]; then
+      printf '%s%s%s %s- %s%s' "${BOLD}" "$label" "${RESET}" "${DIM}" "$desc" "${RESET}"
+    else
+      printf '%s %s- %s%s' "$label" "${DIM}" "$desc" "${RESET}"
+    fi
+  elif [[ "$selected" == "1" ]]; then
+    printf '%s%s%s' "${BOLD}" "$label" "${RESET}"
+  else
+    printf '%s' "$label"
+  fi
+}
+
+option_gum_display() {
+  local spec="$1" label desc
+  label="$(option_label "$spec")"
+  desc="$(option_description "$spec")"
+  if [[ -n "$desc" ]]; then
+    printf '%s - %s' "$label" "$desc"
+  else
+    printf '%s' "$label"
+  fi
+}
+
+prompt_choose() {
+  local prompt="$1"
+  shift
+  local options=("$@")
+  if gum_available; then
+    local choice="" displays=() i
+    for i in "${!options[@]}"; do
+      displays+=("$(option_gum_display "${options[$i]}")")
+    done
+    if choice="$(gum_choose "$prompt" "${displays[@]}" 2>/dev/null)"; then
+      reset_terminal
+      for i in "${!displays[@]}"; do
+        if [[ "${displays[$i]}" == "$choice" ]]; then
+          echo "$(option_value "${options[$i]}")"
+          return 0
+        fi
+      done
+      echo "$choice"
+      return 0
+    fi
+    reset_terminal
+  fi
+  arrow_select "$prompt" "${options[@]}"
+}
+
+multi_values_contains() {
+  local needle="$1"
+  shift || true
+  local item
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+prompt_multi_choose() {
+  local prompt="$1"
+  shift
+  local options=("$@")
+  MULTI_CHOOSE_RESULTS=()
+  MULTI_CHOOSE_OPTIONS=("${options[@]}")
+  MULTI_CHOOSE_SELECTED=()
+
+  local option value
+  for option in "${options[@]}"; do
+    value="$(option_value "$option")"
+    [[ "$value" == "__all__" ]] && continue
+    MULTI_CHOOSE_SELECTED+=("$value")
+  done
+
+  if gum_available; then
+    local displays=() preselected=() choice value
+    for option in "${options[@]}"; do
+      value="$(option_value "$option")"
+      displays+=("$(option_gum_display "$option")")
+      [[ "$value" == "__all__" ]] || preselected+=("$(option_gum_display "$option")")
+    done
+    local selected_csv=""
+    if [[ ${#preselected[@]} -gt 0 ]]; then
+      selected_csv="$(join_by "," "${preselected[@]}")"
+    fi
+    local gum_output=""
+    if gum_output="$(gum_multi_choose "$prompt" "$selected_csv" "${displays[@]}" 2>/dev/null)"; then
+      reset_terminal
+      MULTI_CHOOSE_SELECTED=()
+      local line i
+      while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        for i in "${!displays[@]}"; do
+          if [[ "${displays[$i]}" == "$line" ]]; then
+            value="$(option_value "${options[$i]}")"
+            [[ "$value" == "__all__" ]] || MULTI_CHOOSE_SELECTED+=("$value")
+            break
+          fi
+        done
+      done <<< "$gum_output"
+      MULTI_CHOOSE_RESULTS=()
+      local selected_value
+      for selected_value in "${MULTI_CHOOSE_SELECTED[@]-}"; do
+        [[ -n "$selected_value" ]] && MULTI_CHOOSE_RESULTS+=("$selected_value")
+      done
+      return 0
+    fi
+    reset_terminal
+    return 1
+  fi
+
+  multi_arrow_select "$prompt" "${options[@]}"
+}
+
+prompt_confirm() {
+  local prompt="$1" default="${2:-y}"
+  if gum_available; then
+    local status=0
+    if gum_confirm "$prompt" 2>/dev/null; then
+      status=0
+    else
+      status=$?
+    fi
+    reset_terminal
+    return "$status"
+  fi
+  confirm "$prompt" "$default"
+}
+
+join_by() {
+  local sep="$1"
+  shift
+  local out="" item
+  for item in "$@"; do
+    if [[ -z "$out" ]]; then
+      out="$item"
+    else
+      out="${out}${sep}${item}"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+ask() {
+  local prompt="$1" default="${2:-}" hint="${3:-}"
+  local fb=""
+  [[ -n "$default" ]] && fb=" ${DIM}(${default})${RESET}"
+  [[ -n "$hint" ]] && printf '  %s %s\n' "${DIM}↳${RESET}" "$hint" >&2
+  printf '%s' "${BOLD}${prompt}${RESET}${fb}${DIM}: ${RESET}" >&2
+  local reply
+  if ! read_from_tty reply; then
+    # If read_from_tty fails (no tty), try reading from stdin
+    IFS= read -r reply || reply=""
+  fi
+  reply="${reply:-$default}"
+  echo "$reply"
+}
+
+confirm() {
+  local prompt="$1" default="${2:-y}"
+  local hint="Y/n"
+  [[ "$default" == "n" ]] && hint="y/N"
+  local reply normalized
+  trap 'printf "\n  Cancelled.\n" >&2; exit 1' INT
+  while true; do
+    printf '%s' "${BOLD}${prompt}${RESET} ${DIM}${hint}${RESET}: " >&2
+    if ! read_from_tty reply; then
+      # If read_from_tty fails (no tty), try reading from stdin
+      if ! IFS= read -r reply; then
+        # If stdin also fails (EOF), use default
+        printf '\n  %s\n' "${R}Cannot read from terminal.${RESET}" >&2
+        reply="$default"
+      fi
+    fi
+    reply="${reply:-$default}"
+    normalized="$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')"
+    case "$normalized" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+      *) printf '  %s\n' "${R}Please answer y/yes or n/no.${RESET}" >&2 ;;
+    esac
+  done
+}
+
+reset_terminal() {
+  stty sane 2>/dev/null || true
+}
+
+select_menu() {
+  local prompt="$1"
+  shift
+  local options=("$@")
+
+  printf '%s\n' "${BOLD}${prompt}${RESET}" >&2
+  for i in "${!options[@]}"; do
+    printf '  %s %s\n' "${DIM}$((i+1)).${RESET}" "$(option_display "${options[$i]}")" >&2
+  done
+
+  local choice
+  while true; do
+    printf '%s' "${DIM}  Enter number [1-${#options[@]}]: ${RESET}" >&2
+    if ! read_from_tty choice; then
+      # If read_from_tty fails (no tty), try reading from stdin
+      if ! IFS= read -r choice; then
+        # If stdin also fails (EOF), default to 1
+        choice="1"
+      fi
+    fi
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
+      echo "$(option_value "${options[$((choice-1))]}")"
+      return
+    fi
+    printf '  %s\n' "${R}Invalid choice. Try again.${RESET}" >&2
+  done
+}
+
+arrow_select() {
+  local prompt="$1"
+  shift
+  local options=("$@")
+
+  if [[ "${NUMBERED:-0}" == "1" ]] || [[ ! -t 0 ]]; then
+    select_menu "$prompt" "${options[@]}"
+    return
+  fi
+
+  if ! command -v stty >/dev/null 2>&1; then
+    select_menu "$prompt" "${options[@]}"
+    return
+  fi
+
+  local count=${#options[@]}
+  local current=0
+  local key seq part
+  local old_stty
+  old_stty=$(stty -g 2>/dev/null) || { select_menu "$prompt" "${options[@]}"; return; }
+
+  render_arrow_options() {
+    local i
+    for i in "${!options[@]}"; do
+      if (( i == current )); then
+        printf '\r\033[2K  %s %s %s\n' "${C}" "▶" "$(option_display "${options[$i]}" 1)" >&2
+      else
+        printf '\r\033[2K    %s\n' "$(option_display "${options[$i]}")" >&2
+      fi
+    done
+  }
+
+  clear_arrow_options() {
+    local i
+    printf '\033[%dF' "$count" >&2
+    for i in "${!options[@]}"; do
+      printf '\r\033[2K\n' >&2
+    done
+  }
+
+  printf '\n  %s\n' "${BOLD}${prompt}${RESET}" >&2
+  printf '  %s\n' "${DIM}↑/↓ to move, Enter to confirm, q to cancel${RESET}" >&2
+  render_arrow_options
+
+  if ! stty raw -echo 2>/dev/null; then
+    clear_arrow_options
+    printf '\n  %s arrow-key mode failed, falling back to numbered menu\n' "${Y}⚠${RESET}" >&2
+    select_menu "$prompt" "${options[@]}"
+    return
+  fi
+
+  local old_int_trap old_term_trap old_exit_trap
+  old_int_trap="$(trap -p INT || true)"
+  old_term_trap="$(trap -p TERM || true)"
+  old_exit_trap="$(trap -p EXIT || true)"
+
+  restore_arrow_traps() {
+    if [[ -n "$old_int_trap" ]]; then eval "$old_int_trap"; else trap - INT; fi
+    if [[ -n "$old_term_trap" ]]; then eval "$old_term_trap"; else trap - TERM; fi
+    if [[ -n "$old_exit_trap" ]]; then eval "$old_exit_trap"; else trap - EXIT; fi
+  }
+
+  cleanup_arrow() {
+    stty "$old_stty" 2>/dev/null || true
+    printf '\033[?25h' >&2
+    restore_arrow_traps
+  }
+  trap 'cleanup_arrow; printf "\n  Cancelled.\n" >&2; exit 1' INT TERM
+  trap 'cleanup_arrow' EXIT
+
+  while true; do
+    IFS= read -r -n 1 -s key 2>/dev/null || { cleanup_arrow; return 1; }
+    case "$key" in
+      $'\x1b')
+        seq=""
+        while IFS= read -r -n 1 -s -t 1 part 2>/dev/null; do
+          seq+="$part"
+          [[ ${#seq} -ge 2 ]] && break
+        done
+        case "$seq" in
+          '[A'|'OA') ((current--)); ((current < 0)) && current=$((count - 1)) ;;
+          '[B'|'OB') ((current++)); ((current >= count)) && current=0 ;;
+          *) continue ;;
+        esac
+        printf '\033[%dF' "$count" >&2
+        render_arrow_options
+        ;;
+      ''|$'\r'|$'\n')
+        cleanup_arrow
+        echo "$(option_value "${options[$current]}")"
+        return
+        ;;
+      q|Q)
+        cleanup_arrow
+        printf '\n  Cancelled.\n' >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
+multi_option_is_selected() {
+  local value="$1"
+  if [[ "$value" == "__all__" ]]; then
+    local option regular_value
+    for option in "${MULTI_CHOOSE_OPTIONS[@]}"; do
+      regular_value="$(option_value "$option")"
+      [[ "$regular_value" == "__all__" ]] && continue
+      multi_values_contains "$regular_value" "${MULTI_CHOOSE_SELECTED[@]-}" || return 1
+    done
+    return 0
+  fi
+  multi_values_contains "$value" "${MULTI_CHOOSE_SELECTED[@]-}"
+}
+
+toggle_multi_option() {
+  local value="$1"
+  local option regular_value updated=()
+  if [[ "$value" == "__all__" ]]; then
+    if multi_option_is_selected "__all__"; then
+      MULTI_CHOOSE_SELECTED=()
+    else
+      MULTI_CHOOSE_SELECTED=()
+      for option in "${MULTI_CHOOSE_OPTIONS[@]}"; do
+        regular_value="$(option_value "$option")"
+        [[ "$regular_value" == "__all__" ]] && continue
+        MULTI_CHOOSE_SELECTED+=("$regular_value")
+      done
+    fi
+    return
+  fi
+
+  if multi_values_contains "$value" "${MULTI_CHOOSE_SELECTED[@]-}"; then
+    for regular_value in "${MULTI_CHOOSE_SELECTED[@]-}"; do
+      [[ "$regular_value" == "$value" ]] || updated+=("$regular_value")
+    done
+    MULTI_CHOOSE_SELECTED=("${updated[@]}")
+  else
+    MULTI_CHOOSE_SELECTED+=("$value")
+  fi
+}
+
+render_multi_option_line() {
+  local option="$1" selected="${2:-0}" prefix="${3:-    }" current="${4:-0}"
+  local marker="○"
+  [[ "$selected" == "1" ]] && marker="●"
+  printf '\r\033[2K%s%s %s\n' "$prefix" "$marker" "$(option_display "$option" "$current")" >&2
+}
+
+multi_select_menu() {
+  local prompt="$1"
+  shift
+  local options=("$@")
+  local choice continue_index=$(( ${#options[@]} + 1 )) cancel_index=$(( ${#options[@]} + 2 ))
+
+  while true; do
+    printf '%s\n' "${BOLD}${prompt}${RESET}" >&2
+    printf '  %s\n' "${DIM}Toggle file types, then continue with the selected batches.${RESET}" >&2
+    local i option value
+    for i in "${!options[@]}"; do
+      option="${options[$i]}"
+      value="$(option_value "$option")"
+      printf '  %s ' "${DIM}$((i+1)).${RESET}" >&2
+      if multi_option_is_selected "$value"; then
+        render_multi_option_line "$option" 1 "" 0
+      else
+        render_multi_option_line "$option" 0 "" 0
+      fi
+    done
+    printf '  %s %s\n' "${DIM}${continue_index}.${RESET}" "Continue with selected file types" >&2
+    printf '  %s %s\n' "${DIM}${cancel_index}.${RESET}" "Cancel selection" >&2
+    printf '%s' "${DIM}  Enter number to toggle or continue: ${RESET}" >&2
+    read_from_tty choice || choice="$continue_index"
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+      if (( choice >= 1 && choice <= ${#options[@]} )); then
+        toggle_multi_option "$(option_value "${options[$((choice-1))]}")"
+        printf '\n' >&2
+        continue
+      fi
+      if (( choice == continue_index )); then
+        MULTI_CHOOSE_RESULTS=()
+        local selected_value
+        for selected_value in "${MULTI_CHOOSE_SELECTED[@]-}"; do
+          [[ -n "$selected_value" ]] && MULTI_CHOOSE_RESULTS+=("$selected_value")
+        done
+        return 0
+      fi
+      if (( choice == cancel_index )); then
+        return 1
+      fi
+    fi
+    printf '  %s\n\n' "${R}Invalid choice. Try again.${RESET}" >&2
+  done
+}
+
+multi_arrow_select() {
+  local prompt="$1"
+  shift
+  local options=("$@")
+
+  if [[ "${NUMBERED:-0}" == "1" ]] || [[ ! -t 0 ]]; then
+    multi_select_menu "$prompt" "${options[@]}"
+    return
+  fi
+
+  if ! command -v stty >/dev/null 2>&1; then
+    multi_select_menu "$prompt" "${options[@]}"
+    return
+  fi
+
+  local total_rows=$(( ${#options[@]} + 2 ))
+  local current=${#options[@]} key seq part
+  local old_stty
+  old_stty=$(stty -g 2>/dev/null) || { multi_select_menu "$prompt" "${options[@]}"; return; }
+
+  render_multi_arrow_rows() {
+    local i option value
+    for ((i = 0; i < total_rows; i++)); do
+      if (( i < ${#options[@]} )); then
+        option="${options[$i]}"
+        value="$(option_value "$option")"
+        local row="    "
+        (( i == current )) && row="  ${C}▶${RESET} "
+        if multi_option_is_selected "$value"; then
+          render_multi_option_line "$option" 1 "$row" $(( i == current ? 1 : 0 ))
+        else
+          render_multi_option_line "$option" 0 "$row" $(( i == current ? 1 : 0 ))
+        fi
+      elif (( i == ${#options[@]} )); then
+        if (( i == current )); then
+          printf '\r\033[2K  %s▶%s %sContinue with selected file types%s\n' "${C}" "${RESET}" "${BOLD}" "${RESET}" >&2
+        else
+          printf '\r\033[2K    Continue with selected file types\n' >&2
+        fi
+      else
+        if (( i == current )); then
+          printf '\r\033[2K  %s▶%s %sCancel selection%s\n' "${C}" "${RESET}" "${BOLD}" "${RESET}" >&2
+        else
+          printf '\r\033[2K    Cancel selection\n' >&2
+        fi
+      fi
+    done
+  }
+
+  clear_multi_arrow_rows() {
+    local i
+    printf '\033[%dF' "$total_rows" >&2
+    for ((i = 0; i < total_rows; i++)); do
+      printf '\r\033[2K\n' >&2
+    done
+  }
+
+  printf '\n  %s\n' "${BOLD}${prompt}${RESET}" >&2
+  printf '  %s\n' "${DIM}↑/↓ to move, Space to select, Enter to confirm, q to cancel${RESET}" >&2
+  render_multi_arrow_rows
+
+  if ! stty raw -echo 2>/dev/null; then
+    clear_multi_arrow_rows
+    printf '\n  %s arrow-key mode failed, falling back to numbered menu\n' "${Y}⚠${RESET}" >&2
+    multi_select_menu "$prompt" "${options[@]}"
+    return
+  fi
+
+  local old_int_trap old_term_trap old_exit_trap
+  old_int_trap="$(trap -p INT || true)"
+  old_term_trap="$(trap -p TERM || true)"
+  old_exit_trap="$(trap -p EXIT || true)"
+
+  restore_multi_arrow_traps() {
+    if [[ -n "$old_int_trap" ]]; then eval "$old_int_trap"; else trap - INT; fi
+    if [[ -n "$old_term_trap" ]]; then eval "$old_term_trap"; else trap - TERM; fi
+    if [[ -n "$old_exit_trap" ]]; then eval "$old_exit_trap"; else trap - EXIT; fi
+  }
+
+  cleanup_multi_arrow() {
+    stty "$old_stty" 2>/dev/null || true
+    printf '\033[?25h' >&2
+    restore_multi_arrow_traps
+  }
+  trap 'cleanup_multi_arrow; printf "\n  Cancelled.\n" >&2; exit 1' INT TERM
+  trap 'cleanup_multi_arrow' EXIT
+
+  while true; do
+    IFS= read -r -n 1 -s key 2>/dev/null || { cleanup_multi_arrow; return 1; }
+    case "$key" in
+      $'\x1b')
+        seq=""
+        while IFS= read -r -n 1 -s -t 1 part 2>/dev/null; do
+          seq+="$part"
+          [[ ${#seq} -ge 2 ]] && break
+        done
+        case "$seq" in
+          '[A'|'OA') ((current--)); ((current < 0)) && current=$((total_rows - 1)) ;;
+          '[B'|'OB') ((current++)); ((current >= total_rows)) && current=0 ;;
+          *) continue ;;
+        esac
+        printf '\033[%dF' "$total_rows" >&2
+        render_multi_arrow_rows
+        ;;
+      ' '|''|$'\r'|$'\n')
+        if (( current < ${#options[@]} )); then
+          toggle_multi_option "$(option_value "${options[$current]}")"
+          printf '\033[%dF' "$total_rows" >&2
+          render_multi_arrow_rows
+        elif (( current == ${#options[@]} )); then
+          cleanup_multi_arrow
+          MULTI_CHOOSE_RESULTS=()
+          local selected_value
+          for selected_value in "${MULTI_CHOOSE_SELECTED[@]-}"; do
+            [[ -n "$selected_value" ]] && MULTI_CHOOSE_RESULTS+=("$selected_value")
+          done
+          return 0
+        else
+          cleanup_multi_arrow
+          printf '\n  Cancelled.\n' >&2
+          return 1
+        fi
+        ;;
+      q|Q)
+        cleanup_multi_arrow
+        printf '\n  Cancelled.\n' >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
+normalize_path_input() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ ${#value} -ge 2 ]]; then
+    if [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]] || [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+  fi
+  value="${value//\\ / }"
+  echo "$value"
+}
+
+expand_home() {
+  local path="$1"
+  if [[ "$path" == "~"* ]]; then
+    path="${path/#\~/$HOME}"
+  fi
+  echo "$path"
+}
+
+# ── Gum integration (optional, private install) ─────────────────────────────
+pilosa_gum() {
+  if [ -x "${PILOSA_HOME}/bin/gum" ]; then
+    "${PILOSA_HOME}/bin/gum" "$@"
+  else
+    return 127
+  fi
+}
+
+# ── checksum helper ─────────────────────────────────────────────────────────
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+download_file() {
+  local url="$1" dest="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fSL --progress-bar "$url" -o "$dest" 2>&2
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --show-progress "$url" -O "$dest"
+  else
+    die "Neither curl nor wget found. Please install one."
+  fi
+}
+
+verify_checksum() {
+  local file="$1" expected="$2"
+  local actual
+  actual="$(sha256_file "$file" 2>/dev/null || true)"
+  [[ -n "$actual" ]] || die "No SHA-256 tool found. Cannot verify release artifact."
+  [[ "$actual" == "$expected" ]] || die "Checksum mismatch for $(basename "$file")"
+}
+
+manifest_hash() {
+  local manifest="$1" path="$2"
+  awk -F '\t' -v p="$path" '$1 == p { print $2; exit }' "$manifest"
+}
+
+framework_version() {
+  local root="$1"
+  if [[ -f "${root}/metadata/version" ]]; then
+    sed -n '1p' "${root}/metadata/version"
+  else
+    echo "dev"
+  fi
+}
+
+is_release_managed_role() {
+  local role="$1"
+  [[ "$role" != "user_state" && "$role" != "generated_state" ]]
+}
+
+next_sidecar_path() {
+  local dst="$1"
+  local sidecar="${dst}.pilosa-new"
+  local n=1
+  while [[ -e "$sidecar" ]]; do
+    sidecar="${dst}.pilosa-new.${n}"
+    n=$((n + 1))
+  done
+  echo "$sidecar"
+}
+
+resolve_latest_release_version() {
+  local url
+  if ! command -v curl >/dev/null 2>&1; then
+    die "curl is required to resolve latest. Use --version X.Y.Z instead."
+  fi
+  spinner_start "Resolving latest version" >&2
+  url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/${PILOSA_REPO}/releases/latest" 2>/dev/null || true)"
+  spinner_stop >&2
+  [[ -n "$url" && "$url" != */latest ]] || die "Could not resolve latest version. Use --version X.Y.Z instead."
+  basename "$url" | sed 's/^v//'
+}
+
+release_dir_version() {
+  local release_dir="$1" version="$2"
+  if [[ "$version" != "latest" ]]; then
+    echo "$version"
+    return
+  fi
+  basename "$release_dir" | sed 's/^v//'
+}
+
+prepare_release_framework() {
+  local requested_version="$1" release_dir="$2" tmpdir="$3"
+  local version archive_name archive_path checksums_path expected framework_dir
+
+  if [[ -n "$release_dir" ]]; then
+    version="$(release_dir_version "$release_dir" "$requested_version")"
+  elif [[ "$requested_version" == "latest" ]]; then
+    version="$(resolve_latest_release_version)"
+  else
+    version="$requested_version"
+  fi
+
+  archive_name="pilosa-framework-${version}.tar.gz"
+  archive_path="${tmpdir}/${archive_name}"
+  checksums_path="${tmpdir}/checksums.txt"
+
+  if [[ -n "$release_dir" ]]; then
+    [[ -f "${release_dir}/${archive_name}" ]] || die "Release archive not found: ${release_dir}/${archive_name}"
+    [[ -f "${release_dir}/checksums.txt" ]] || die "Release checksums not found: ${release_dir}/checksums.txt"
+    cp "${release_dir}/${archive_name}" "$archive_path"
+    cp "${release_dir}/checksums.txt" "$checksums_path"
+  else
+    local base_url="${PILOSA_RELEASE_BASE_URL:-https://github.com/${PILOSA_REPO}/releases/download/v${version}}"
+    printf '\n' >&2
+    info "Downloading framework v${version}..."
+    download_file "${base_url}/${archive_name}" "$archive_path"
+    download_file "${base_url}/checksums.txt" "$checksums_path"
+  fi
+
+  expected="$(awk -v f="$archive_name" '$2 == f { print $1; exit }' "$checksums_path")"
+  [[ -n "$expected" ]] || die "${archive_name} not found in checksums.txt"
+  verify_checksum "$archive_path" "$expected"
+
+  tar -xzf "$archive_path" -C "$tmpdir"
+  framework_dir="${tmpdir}/pilosa-framework-${version}"
+  [[ -f "${framework_dir}/.pilosa/framework-files.tsv" ]] || die "Release manifest missing from archive"
+  printf '%s\t%s\n' "$version" "$framework_dir"
+}
+
+copy_to_clipboard() {
+  local text="$1"
+  if command -v pbcopy >/dev/null 2>&1; then
+    printf '%s' "$text" | pbcopy
+  elif command -v xclip >/dev/null 2>&1; then
+    printf '%s' "$text" | xclip -selection clipboard
+  elif command -v xsel >/dev/null 2>&1; then
+    printf '%s' "$text" | xsel --clipboard --input
+  elif command -v clip.exe >/dev/null 2>&1; then
+    printf '%s' "$text" | clip.exe
+  else
+    return 1
+  fi
+}
+
+sanitize_yaml() { printf '%s' "$1" | tr '"' "'" | tr '\n' ' '; }
+
+shell_quote() {
+  local value="$1"
+  value="${value//\'/\'\\\'\'}"
+  printf "'%s'" "$value"
+}
+
+prompt_preview() {
+  local line count=0
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+    count=$((count + 1))
+    [[ "$count" -ge 4 ]] && break
+  done
+  printf '...\n'
+}
+
+print_box() {
+  printf '\n  %s┌%s┐%s\n' "${DIM}" "$(printf '%.0s─' 1 {1..76})" "${RESET}"
+  printf '  %s│%s %s%s%s\n' "${DIM}" "${RESET}" "${BOLD}$1${RESET}" "${DIM}" "${RESET}"
+  printf '  %s├%s┤%s\n' "${DIM}" "$(printf '%.0s─' 1 {1..76})" "${RESET}"
+  while IFS= read -r line; do
+    printf '  %s│%s %s\n' "${DIM}" "${RESET}" "$line"
+  done
+  printf '  %s└%s┘%s\n' "${DIM}" "$(printf '%.0s─' 1 {1..76})" "${RESET}"
+}
+
+preferred_cli_name() {
+  case "$1" in
+    claude_code) echo "Claude Code" ;;
+    claude_code_desktop) echo "Claude Code Desktop" ;;
+    codex) echo "Codex" ;;
+    codex_app) echo "Codex App" ;;
+    opencode) echo "OpenCode" ;;
+    opencode_desktop) echo "OpenCode Desktop" ;;
+    kilo) echo "Kilo" ;;
+    other) echo "Other" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+handoff_action_label() {
+  case "$1" in
+    copy_command) echo "Copy launch command" ;;
+    run_now) echo "Run launch command now" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+build_launch_command() {
+  local root="$1" cli="$2" prompt="$3" root_cmd
+  root_cmd="$(shell_quote "$root")"
+
+  case "$cli" in
+    codex)
+      printf 'codex -C %s "$(cat <<'\''PILOSA_STARTUP_PROMPT'\''\n' "$root_cmd"
+      printf '%s\n' "$prompt"
+      printf 'PILOSA_STARTUP_PROMPT\n)"\n'
+      ;;
+    codex_app)
+      printf 'codex app %s\n' "$root_cmd"
+      ;;
+    opencode)
+      printf 'opencode --prompt "$(cat <<'\''PILOSA_STARTUP_PROMPT'\''\n'
+      printf '%s\n' "$prompt"
+      printf 'PILOSA_STARTUP_PROMPT\n)" %s\n' "$root_cmd"
+      ;;
+    opencode_desktop)
+      printf 'opencode %s\n' "$root_cmd"
+      ;;
+    claude_code)
+      printf 'cd %s && claude "$(cat <<'\''PILOSA_STARTUP_PROMPT'\''\n' "$root_cmd"
+      printf '%s\n' "$prompt"
+      printf 'PILOSA_STARTUP_PROMPT\n)"\n'
+      ;;
+    claude_code_desktop)
+      local encoded_prompt
+      encoded_prompt="$(printf '%s' "$prompt" | python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=""))' 2>/dev/null || printf '%s' "$prompt" | sed 's/ /%20/g; s/"/%22/g')"
+      printf 'open "claude://code/new?q=%s&folder=%s"\n' "$encoded_prompt" "$root_cmd"
+      ;;
+    kilo)
+      printf 'cd %s && kilo "$(cat <<'\''PILOSA_STARTUP_PROMPT'\''\n' "$root_cmd"
+      printf '%s\n' "$prompt"
+      printf 'PILOSA_STARTUP_PROMPT\n)"\n'
+      ;;
+    *)
+      printf 'cd %s && <your-llm-cli> "$(cat <<'\''PILOSA_STARTUP_PROMPT'\''\n' "$root_cmd"
+      printf '%s\n' "$prompt"
+      printf 'PILOSA_STARTUP_PROMPT\n)"\n'
+      ;;
+  esac
+}
+
+run_cli_with_prompt() {
+  local root="$1" cli="$2" prompt="$3"
+  case "$cli" in
+    codex)
+      command -v codex >/dev/null 2>&1 || { warn "codex was not found on PATH."; return 1; }
+      exec codex -C "$root" "$prompt"
+      ;;
+    codex_app)
+      command -v codex >/dev/null 2>&1 || { warn "codex was not found on PATH."; return 1; }
+      copy_to_clipboard "$prompt"
+      codex app "$root" &
+      ok "Prompt copied to clipboard — paste it in the Codex app."
+      ;;
+    opencode)
+      command -v opencode >/dev/null 2>&1 || { warn "opencode was not found on PATH."; return 1; }
+      exec opencode --prompt "$prompt" "$root"
+      ;;
+    opencode_desktop)
+      command -v opencode >/dev/null 2>&1 || { warn "opencode was not found on PATH."; return 1; }
+      copy_to_clipboard "$prompt"
+      opencode "$root" &
+      ok "Prompt copied to clipboard — paste it in the OpenCode TUI."
+      ;;
+    claude_code)
+      command -v claude >/dev/null 2>&1 || { warn "claude was not found on PATH."; return 1; }
+      cd "$root"
+      exec claude "$prompt"
+      ;;
+    claude_code_desktop)
+      local encoded_prompt
+      encoded_prompt="$(printf '%s' "$prompt" | python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=""))' 2>/dev/null || printf '%s' "$prompt" | sed 's/ /%20/g; s/"/%22/g')"
+      if [[ "$(uname)" == "Darwin" ]]; then
+        open "claude://code/new?q=${encoded_prompt}&folder=${root}"
+        ok "Opening Claude Code Desktop with pre-filled prompt."
+      else
+        copy_to_clipboard "$prompt"
+        ok "Prompt copied to clipboard — open Claude Code Desktop and paste it."
+      fi
+      ;;
+    kilo)
+      command -v kilo >/dev/null 2>&1 || { warn "kilo was not found on PATH."; return 1; }
+      cd "$root"
+      exec kilo "$prompt"
+      ;;
+    *)
+      warn "Run-now is only available for known CLI choices."
+      return 1
+      ;;
+  esac
+}
+
+should_skip_source_file() {
+  local name lower_name
+  name="$(basename "$1")"
+  lower_name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  [[ "$lower_name" == "agents.md" ]] && return 0
+  case "$1" in
+    */.DS_Store|*/.gitkeep|*/node_modules/*|*/.git/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+file_ext() {
+  local name ext
+  name="$(basename "$1")"
+  [[ "$name" == *.* ]] || { echo ""; return; }
+  ext="${name##*.}"
+  printf '%s' "$ext" | tr '[:upper:]' '[:lower:]'
+}
+
+ext_in_list() {
+  local ext="$1" list="$2"
+  case "|$list|" in
+    *"|$ext|"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_markdown_convertible_file() { local ext; ext="$(file_ext "$1")"; [[ -n "$ext" ]] && ext_in_list "$ext" "$MARKDOWN_EXTENSIONS"; }
+is_native_readable_file() { local ext; ext="$(file_ext "$1")"; [[ -n "$ext" ]] && ext_in_list "$ext" "$NATIVE_EXTENSIONS"; }
+is_binary_copyable_file() { local ext; ext="$(file_ext "$1")"; [[ -n "$ext" ]] && ext_in_list "$ext" "$BINARY_COPYABLE_EXTENSIONS"; }
+
+
+
+markdown_raw_rel_path() {
+  local rel_path="$1" name dir stem ext
+  name="$(basename "$rel_path")"
+  dir="$(dirname "$rel_path")"
+  ext="$(file_ext "$rel_path")"
+  [[ "$ext" == "md" ]] && { echo "$rel_path"; return; }
+  stem="${name%.*}"
+  if [[ "$dir" == "." ]]; then
+    echo "${stem}__${ext}.md"
+  else
+    echo "${dir}/${stem}__${ext}.md"
+  fi
+}
+
+truncate_display_path() {
+  local value="$1" max_len="$2"
+  if (( ${#value} <= max_len )); then
+    echo "$value"
+  else
+    echo "...${value:$((${#value} - max_len + 3))}"
+  fi
+}
+
+plural_count() {
+  local count="$1" singular="$2" plural="${3:-$2s}"
+  if [[ "$count" -eq 1 ]]; then
+    printf '1 %s' "$singular"
+  else
+    printf '%d %s' "$count" "$plural"
+  fi
+}
+
+file_size_bytes() {
+  local path="$1"
+  if stat -c %s "$path" >/dev/null 2>&1; then
+    stat -c %s "$path"
+  elif stat -f %z "$path" >/dev/null 2>&1; then
+    stat -f %z "$path"
+  else
+    printf '0'
+  fi
+}
+
+format_bytes() {
+  local bytes="$1"
+  if [[ "$bytes" -ge 1073741824 ]]; then
+    printf '%d.%02d GB' $((bytes / 1073741824)) $(((bytes % 1073741824) * 100 / 1073741824))
+  elif [[ "$bytes" -ge 1048576 ]]; then
+    printf '%d.%02d MB' $((bytes / 1048576)) $(((bytes % 1048576) * 100 / 1048576))
+  elif [[ "$bytes" -ge 1024 ]]; then
+    printf '%d.%02d KB' $((bytes / 1024)) $(((bytes % 1024) * 100 / 1024))
+  else
+    printf '%d B' "$bytes"
+  fi
+}
+
+available_disk_bytes() {
+  local path="$1"
+  local value
+  value="$(df -Pk "$path" 2>/dev/null | awk 'NR==2 {print $4}')" || value=""
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%d' $((value * 1024))
+  else
+    printf '0'
+  fi
+}
+
+spinner_frame() {
+  local index="$1"
+  local frames=("◐" "◓" "◑" "◒")
+  printf '%s' "${frames[$((index % ${#frames[@]}))]}"
+}
+
+file_type_color() {
+  local kind="$1"
+  case "$kind" in
+    markdown) printf '%s' "${G}" ;;
+    native) printf '%s' "${C}" ;;
+    pdf) printf '%s' "${M}" ;;
+    image) printf '%s' "${Y}" ;;
+    video) printf '%s' "${B}" ;;
+    audio) printf '%s' "${R}" ;;
+    unknown) printf '%s' "${BOLD}${R}" ;;
+    ignored) printf '%s' "${DIM}" ;;
+    *) printf '%s' "${DIM}" ;;
+  esac
+}
+
+file_type_label() {
+  local kind="$1" label="$2"
+  printf '%s%s%s' "$(file_type_color "$kind")" "$label" "${RESET}"
+}
+
+reset_import_batches() {
+  IMPORT_BATCH_EXTENSIONS=()
+  IMPORT_BATCH_COUNTS=()
+  IMPORT_BATCH_BYTES=()
+  SELECTED_IMPORT_EXTENSIONS=()
+}
+
+import_batch_index() {
+  local ext="$1" i
+  for i in "${!IMPORT_BATCH_EXTENSIONS[@]}"; do
+    [[ "${IMPORT_BATCH_EXTENSIONS[$i]}" == "$ext" ]] && { printf '%s' "$i"; return 0; }
+  done
+  return 1
+}
+
+record_import_batch() {
+  local ext="$1" size="$2" idx=""
+  idx="$(import_batch_index "$ext" 2>/dev/null || true)"
+  if [[ -n "$idx" ]]; then
+    IMPORT_BATCH_COUNTS[$idx]=$((IMPORT_BATCH_COUNTS[$idx] + 1))
+    IMPORT_BATCH_BYTES[$idx]=$((IMPORT_BATCH_BYTES[$idx] + size))
+  else
+    IMPORT_BATCH_EXTENSIONS+=("$ext")
+    IMPORT_BATCH_COUNTS+=("1")
+    IMPORT_BATCH_BYTES+=("$size")
+  fi
+}
+
+sort_import_batches() {
+  local i j tmp_ext tmp_count tmp_bytes
+  for ((i = 1; i < ${#IMPORT_BATCH_EXTENSIONS[@]}; i++)); do
+    tmp_ext="${IMPORT_BATCH_EXTENSIONS[$i]}"
+    tmp_count="${IMPORT_BATCH_COUNTS[$i]}"
+    tmp_bytes="${IMPORT_BATCH_BYTES[$i]}"
+    j=$i
+    while (( j > 0 )) && [[ "${IMPORT_BATCH_EXTENSIONS[$((j-1))]}" > "$tmp_ext" ]]; do
+      IMPORT_BATCH_EXTENSIONS[$j]="${IMPORT_BATCH_EXTENSIONS[$((j-1))]}"
+      IMPORT_BATCH_COUNTS[$j]="${IMPORT_BATCH_COUNTS[$((j-1))]}"
+      IMPORT_BATCH_BYTES[$j]="${IMPORT_BATCH_BYTES[$((j-1))]}"
+      j=$((j - 1))
+    done
+    IMPORT_BATCH_EXTENSIONS[$j]="$tmp_ext"
+    IMPORT_BATCH_COUNTS[$j]="$tmp_count"
+    IMPORT_BATCH_BYTES[$j]="$tmp_bytes"
+  done
+}
+
+select_all_import_batches() {
+  SELECTED_IMPORT_EXTENSIONS=("${IMPORT_BATCH_EXTENSIONS[@]}")
+}
+
+import_extension_selected() {
+  local ext="$1"
+  multi_values_contains "$ext" "${SELECTED_IMPORT_EXTENSIONS[@]-}"
+}
+
+selected_import_count() {
+  local total=0 i
+  for i in "${!IMPORT_BATCH_EXTENSIONS[@]}"; do
+    if import_extension_selected "${IMPORT_BATCH_EXTENSIONS[$i]}"; then
+      total=$((total + IMPORT_BATCH_COUNTS[$i]))
+    fi
+  done
+  printf '%d' "$total"
+}
+
+selected_copy_count() {
+  local total=0 i ext
+  for i in "${!IMPORT_BATCH_EXTENSIONS[@]}"; do
+    ext="${IMPORT_BATCH_EXTENSIONS[$i]}"
+    if import_extension_selected "$ext"; then
+      if [[ "$ext" != "pdf" ]] && ! ext_in_list "$ext" "$IMAGE_EXTENSIONS"; then
+        total=$((total + IMPORT_BATCH_COUNTS[$i]))
+      fi
+    fi
+  done
+  printf '%d' "$total"
+}
+
+selected_import_bytes() {
+  local total=0 i
+  for i in "${!IMPORT_BATCH_EXTENSIONS[@]}"; do
+    if import_extension_selected "${IMPORT_BATCH_EXTENSIONS[$i]}"; then
+      total=$((total + IMPORT_BATCH_BYTES[$i]))
+    fi
+  done
+  printf '%d' "$total"
+}
+
+selected_import_extensions_label() {
+  local labels=() ext
+  for ext in "${SELECTED_IMPORT_EXTENSIONS[@]-}"; do
+    labels+=(".${ext}")
+  done
+  join_by ", " "${labels[@]}"
+}
+
+classify_source_file() {
+  local path="$1" ext
+  should_skip_source_file "$path" && { echo "ignored"; return; }
+  is_markdown_convertible_file "$path" && { echo "markdown"; return; }
+  is_native_readable_file "$path" && { echo "native"; return; }
+  if is_rapidocr_pdf "$path"; then
+    echo "ocr_convertible"
+    return
+  fi
+  ext="$(file_ext "$path")"
+  case "$ext" in
+    jpg|jpeg|png|gif|webp|heic|heif|tif|tiff|bmp|svg) echo "ocr_convertible" ;;
+    mp4|mov|m4v|avi|mkv|webm|wmv) echo "video" ;;
+    mp3|wav|m4a|aac|flac|ogg|opus|aiff) echo "audio" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+scan_source() {
+  local source_path="$1" f class size spin=0 frame ext
+  reset_import_batches
+  SCAN_TOTAL_COUNT=0
+  SCAN_MARKDOWN_COUNT=0
+  SCAN_NATIVE_COUNT=0
+  SCAN_BINARY_COPYABLE_COUNT=0
+  SCAN_OCR_CONVERTIBLE_COUNT=0
+  SCAN_VIDEO_COUNT=0
+  SCAN_AUDIO_COUNT=0
+  SCAN_UNKNOWN_COUNT=0
+  SCAN_IGNORED_COUNT=0
+  SCAN_MARKDOWN_BYTES=0
+  SCAN_NATIVE_BYTES=0
+  SCAN_BINARY_COPYABLE_BYTES=0
+  SCAN_OCR_CONVERTIBLE_BYTES=0
+  SCAN_VIDEO_BYTES=0
+  SCAN_AUDIO_BYTES=0
+  SCAN_UNKNOWN_BYTES=0
+
+  printf '\n'
+  while IFS= read -r -d '' f; do
+    class="$(classify_source_file "$f")"
+    if [[ "$class" != "ignored" ]]; then
+      SCAN_TOTAL_COUNT=$((SCAN_TOTAL_COUNT + 1))
+      size="$(file_size_bytes "$f")"
+      frame="$(spinner_frame "$spin")"
+      printf '\r\033[2K  %s%s%s %sscanning%s %s' "${C}" "$frame" "${RESET}" "${DIM}" "${RESET}" "$(truncate_display_path "$f" 54)" >&2
+      spin=$((spin + 1))
+    else
+      size=0
+    fi
+    case "$class" in
+      markdown)
+        SCAN_MARKDOWN_COUNT=$((SCAN_MARKDOWN_COUNT + 1))
+        SCAN_MARKDOWN_BYTES=$((SCAN_MARKDOWN_BYTES + size))
+        ext="$(file_ext "$f")"
+        [[ -n "$ext" ]] && record_import_batch "$ext" "$size"
+        ;;
+      native)
+        SCAN_NATIVE_COUNT=$((SCAN_NATIVE_COUNT + 1))
+        SCAN_NATIVE_BYTES=$((SCAN_NATIVE_BYTES + size))
+        ext="$(file_ext "$f")"
+        [[ -n "$ext" ]] && record_import_batch "$ext" "$size"
+        ;;
+      binary_copyable) SCAN_BINARY_COPYABLE_COUNT=$((SCAN_BINARY_COPYABLE_COUNT + 1)); SCAN_BINARY_COPYABLE_BYTES=$((SCAN_BINARY_COPYABLE_BYTES + size)) ;;
+      ocr_convertible)
+        SCAN_OCR_CONVERTIBLE_COUNT=$((SCAN_OCR_CONVERTIBLE_COUNT + 1))
+        SCAN_OCR_CONVERTIBLE_BYTES=$((SCAN_OCR_CONVERTIBLE_BYTES + size))
+        ext="$(file_ext "$f")"
+        [[ -n "$ext" ]] && record_import_batch "$ext" "$size"
+        ;;
+      video) SCAN_VIDEO_COUNT=$((SCAN_VIDEO_COUNT + 1)); SCAN_VIDEO_BYTES=$((SCAN_VIDEO_BYTES + size)) ;;
+      audio) SCAN_AUDIO_COUNT=$((SCAN_AUDIO_COUNT + 1)); SCAN_AUDIO_BYTES=$((SCAN_AUDIO_BYTES + size)) ;;
+      unknown) SCAN_UNKNOWN_COUNT=$((SCAN_UNKNOWN_COUNT + 1)); SCAN_UNKNOWN_BYTES=$((SCAN_UNKNOWN_BYTES + size)) ;;
+      ignored) SCAN_IGNORED_COUNT=$((SCAN_IGNORED_COUNT + 1)) ;;
+    esac
+  done < <(find "$source_path" -type f -print0 2>/dev/null)
+  sort_import_batches
+  select_all_import_batches
+  printf '\r\033[2K' >&2
+}
+
+print_scan_summary() {
+  printf '  %s✓%s Source scan complete\n' "${G}" "${RESET}"
+  [[ "$SCAN_MARKDOWN_COUNT" -gt 0 ]] && printf '  %s├─%s %s to rename to .md (%s)\n' "${DIM}" "${RESET}" "$(file_type_label markdown "$(plural_count "$SCAN_MARKDOWN_COUNT" "text-based file")")" "$(format_bytes "$SCAN_MARKDOWN_BYTES")"
+  [[ "$SCAN_NATIVE_COUNT" -gt 0 ]] && printf '  %s├─%s %s to copy unchanged (%s)\n' "${DIM}" "${RESET}" "$(file_type_label native "$(plural_count "$SCAN_NATIVE_COUNT" "native-readable file")")" "$(format_bytes "$SCAN_NATIVE_BYTES")"
+  if [[ "$SCAN_OCR_CONVERTIBLE_COUNT" -gt 0 ]]; then
+    if rapidocr_ocr_available; then
+      printf '  %s├─%s %s available for OCR (%s)\n' "${DIM}" "${RESET}" "$(file_type_label ocr "$(plural_count "$SCAN_OCR_CONVERTIBLE_COUNT" "PDF and image")")" "$(format_bytes "$SCAN_OCR_CONVERTIBLE_BYTES")"
+    else
+      printf '  %s├─%s %s skipped — RapidOCR OCR not bundled (%s)\n' "${DIM}" "${RESET}" "$(file_type_label ocr "$(plural_count "$SCAN_OCR_CONVERTIBLE_COUNT" "PDF and image")")" "$(format_bytes "$SCAN_OCR_CONVERTIBLE_BYTES")"
+    fi
+  fi
+  [[ "$SCAN_BINARY_COPYABLE_COUNT" -gt 0 ]] && printf '  %s├─%s %s to copy as-is (%s)\n' "${DIM}" "${RESET}" "$(file_type_label pdf "$(plural_count "$SCAN_BINARY_COPYABLE_COUNT" "PDF")")" "$(format_bytes "$SCAN_BINARY_COPYABLE_BYTES")"
+  [[ "$SCAN_VIDEO_COUNT" -gt 0 ]] && printf '  %s├─%s %s skipped (%s)\n' "${DIM}" "${RESET}" "$(file_type_label video "$(plural_count "$SCAN_VIDEO_COUNT" "video")")" "$(format_bytes "$SCAN_VIDEO_BYTES")"
+  [[ "$SCAN_AUDIO_COUNT" -gt 0 ]] && printf '  %s├─%s %s skipped (%s)\n' "${DIM}" "${RESET}" "$(file_type_label audio "$(plural_count "$SCAN_AUDIO_COUNT" "audio file")")" "$(format_bytes "$SCAN_AUDIO_BYTES")"
+  [[ "$SCAN_UNKNOWN_COUNT" -gt 0 ]] && printf '  %s├─%s %s unsupported or unknown (%s)\n' "${DIM}" "${RESET}" "$(file_type_label unknown "$(plural_count "$SCAN_UNKNOWN_COUNT" "file")")" "$(format_bytes "$SCAN_UNKNOWN_BYTES")"
+  printf '  %s└─%s %s ignored\n' "${DIM}" "${RESET}" "$(file_type_label ignored "$(plural_count "$SCAN_IGNORED_COUNT" "file")")"
+  note "RapidOCR OCR handles PDFs and images. Other files are skipped."
+}
+
+scan_copyable_bytes() {
+  printf '%d' "$(selected_import_bytes)"
+}
+
+print_onboarding_preflight() {
+  local root="$1"
+  local raw_dir="$root/raw"
+  local free_bytes cli_output
+  local cli_labels=()
+
+  [[ -d "$raw_dir" ]] || die "Workspace raw/ directory is missing: $raw_dir"
+  [[ -w "$raw_dir" ]] || die "Workspace raw/ directory is not writable: $raw_dir"
+
+  info "Environment preflight"
+  ok "Workspace writable: ${BOLD}${root}${RESET}"
+  if rapidocr_ocr_available; then
+    ok "${M}OCR${RESET} RapidOCR available for PDFs and images"
+  else
+    note "RapidOCR OCR not bundled — PDFs and images will be skipped."
+  fi
+
+  free_bytes="$(available_disk_bytes "$root")"
+  if [[ "$free_bytes" -gt 0 ]]; then
+    note "Free space near workspace: $(format_bytes "$free_bytes")"
+  fi
+
+  cli_output="$(detect_llm_clis)"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && cli_labels+=("$line")
+  done <<< "$cli_output"
+  if [[ ${#cli_labels[@]} -gt 0 ]]; then
+    note "Detected handoff targets: $(join_by ", " "${cli_labels[@]}")"
+  fi
+}
+
+render_copy_progress() {
+  local processed="$1" total="$2" copied="$3" skipped="$4" current_file="${5:-}"
+  local width=28 filled=0 bar="" i
+  [[ "$total" -gt 0 ]] && filled=$((processed * width / total))
+  for ((i = 0; i < width; i++)); do
+    if (( i < filled )); then bar+="█"; else bar+="░"; fi
+  done
+  current_file="$(truncate_display_path "$current_file" 46)"
+  printf '\r\033[2K  %s%s%s %s[%s]%s %d/%d %s (%d copied, %d skipped)' "${C}" "$(spinner_frame "$processed")" "${RESET}" "${C}" "$bar" "${RESET}" "$processed" "$total" "$current_file" "$copied" "$skipped" >&2
+}
+
+render_pdf_progress() {
+  local processed="$1" total="$2" converted="$3" skipped="$4" current_file="${5:-}"
+  local width=28 filled=0 bar="" i
+  [[ "$total" -gt 0 ]] && filled=$((processed * width / total))
+  for ((i = 0; i < width; i++)); do
+    if (( i < filled )); then bar+="◆"; else bar+="◇"; fi
+  done
+  current_file="$(truncate_display_path "$current_file" 44)"
+  printf '\r\033[2K  %s%s PDF → text%s %s[%s]%s %d/%d %s (%d imported, %d skipped)' "${M}" "$(spinner_frame "$processed")" "${RESET}" "${M}" "$bar" "${RESET}" "$processed" "$total" "$current_file" "$converted" "$skipped" >&2
+}
+
+render_ocr_progress() {
+  local processed="$1" total="$2" converted="$3" skipped="$4" current_file="${5:-}" page_info="${6:-}"
+  local width=28 filled=0 bar="" i
+  [[ "$total" -gt 0 ]] && filled=$((processed * width / total))
+  for ((i = 0; i < width; i++)); do
+    if (( i < filled )); then bar+="█"; else bar+="░"; fi
+  done
+  current_file="$(truncate_display_path "$current_file" 44)"
+  local page_label=""
+  [[ -n "$page_info" ]] && page_label=" (page ${page_info})"
+  printf '\r\033[2K  %s%s%s %s[%s]%s %d/%d %s%s (%d converted, %d skipped)' "${M}" "$(spinner_frame "$processed")" "${RESET}" "${M}" "$bar" "${RESET}" "$processed" "$total" "$current_file" "$page_label" "$converted" "$skipped" >&2
+}
+
+copy_source() {
+  local source_path="$1" dest_dir="$2"
+  local total_files
+  total_files="$(selected_copy_count)"
+  [[ "$total_files" -gt 0 ]] || { warn "No copyable files found in source location."; return 1; }
+
+  local copied=0 skipped=0 processed=0 converted=0 ocr_converted=0 ocr_skipped=0 src_file rel_path raw_rel_path dest_file dest_parent
+  local md_name md_dest
+  COPY_TOTAL_COUNT="$total_files"
+  COPY_COPIED_COUNT=0
+  COPY_SKIPPED_COUNT=0
+  render_copy_progress 0 "$total_files" 0 0 ""
+
+  while IFS= read -r -d '' src_file; do
+    should_skip_source_file "$src_file" && continue
+    is_markdown_convertible_file "$src_file" || continue
+    import_extension_selected "$(file_ext "$src_file")" || continue
+    rel_path="${src_file#"$source_path"/}"
+    raw_rel_path="$(markdown_raw_rel_path "$rel_path")"
+    dest_file="$dest_dir/$raw_rel_path"
+    dest_parent="$(dirname "$dest_file")"
+    mkdir -p "$dest_parent"
+    if [[ -f "$dest_file" ]]; then
+      skipped=$((skipped + 1))
+    else
+      cp "$src_file" "$dest_file"
+      copied=$((copied + 1))
+    fi
+    processed=$((processed + 1))
+    render_copy_progress "$processed" "$total_files" "$copied" "$skipped" "$rel_path"
+  done < <(find "$source_path" -type f -print0 2>/dev/null)
+
+  while IFS= read -r -d '' src_file; do
+    should_skip_source_file "$src_file" && continue
+    is_native_readable_file "$src_file" || continue
+    import_extension_selected "$(file_ext "$src_file")" || continue
+    rel_path="${src_file#"$source_path"/}"
+    dest_file="$dest_dir/$rel_path"
+    dest_parent="$(dirname "$dest_file")"
+    mkdir -p "$dest_parent"
+    if [[ -f "$dest_file" ]]; then
+      skipped=$((skipped + 1))
+    else
+      cp "$src_file" "$dest_file"
+      copied=$((copied + 1))
+    fi
+    processed=$((processed + 1))
+    render_copy_progress "$processed" "$total_files" "$copied" "$skipped" "$rel_path"
+  done < <(find "$source_path" -type f -print0 2>/dev/null)
+
+  # RapidOCR OCR pass — PDFs and images → structured Markdown
+  if [[ "${SCAN_OCR_CHOICE:-no}" == "yes" ]]; then
+    if ! rapidocr_ocr_available; then
+      warn "RapidOCR OCR not available — skipping OCR pass"
+    else
+      local ocr_files=()
+      while IFS= read -r -d '' src_file; do
+        should_skip_source_file "$src_file" && continue
+        if is_rapidocr_pdf "$src_file" || is_rapidocr_image "$src_file"; then
+          import_extension_selected "$(file_ext "$src_file")" || continue
+          ocr_files+=("$src_file")
+        fi
+      done < <(find "$source_path" -type f -print0 2>/dev/null)
+
+      if [[ ${#ocr_files[@]} -gt 0 ]]; then
+        printf '\n'
+        info "${M}OCR${RESET} Processing ${#ocr_files[@]} files with RapidOCR..."
+        local ocr_total=${#ocr_files[@]} ocr_idx=0
+        local _ocr_bin
+        _ocr_bin="$(rapidocr_ocr_bin)" || _ocr_bin=""
+        spinner_start "Loading OCR engine" >&2
+        for src_file in "${ocr_files[@]}"; do
+          rel_path="${src_file#"$source_path"/}"
+          md_name="$(basename "$rel_path")"
+          md_name="${md_name%.*}"
+          md_dest="$dest_dir/$(dirname "$rel_path")/${md_name}.md"
+          dest_parent="$(dirname "$md_dest")"
+          mkdir -p "$dest_parent"
+          if [[ -f "$md_dest" ]]; then
+            skipped=$((skipped + 1))
+            ocr_skipped=$((ocr_skipped + 1))
+          else
+            local _ocr_page="" _ocr_ok=1
+            local _ocr_fifo
+            _ocr_fifo="$(mktemp -u)"
+            if [[ -n "$_ocr_bin" ]] && mkfifo "$_ocr_fifo" 2>/dev/null; then
+              "$_ocr_bin" "$src_file" "$md_dest" 2>"$_ocr_fifo" &
+              local _ocr_pid=$!
+              while IFS= read -r _line < "$_ocr_fifo"; do
+                [[ "$_line" == PROGRESS\ * ]] && _ocr_page="${_line#PROGRESS }"
+              done
+              wait "$_ocr_pid" 2>/dev/null
+              _ocr_ok=$?
+              rm -f "$_ocr_fifo"
+            elif [[ -n "$_ocr_bin" ]]; then
+              "$_ocr_bin" "$src_file" "$md_dest" 2>/dev/null
+              _ocr_ok=$?
+            else
+              _ocr_ok=1
+            fi
+            if [[ "$_ocr_ok" -eq 0 ]]; then
+              converted=$((converted + 1))
+              ocr_converted=$((ocr_converted + 1))
+              copied=$((copied + 1))
+            else
+              spinner_stop >&2
+              printf '\n' >&2
+              warn "OCR failed for $(basename "$src_file"), skipping"
+              skipped=$((skipped + 1))
+              ocr_skipped=$((ocr_skipped + 1))
+            fi
+          fi
+          ocr_idx=$((ocr_idx + 1))
+          if [[ "$ocr_idx" -eq 1 ]]; then
+            spinner_stop >&2
+          fi
+          render_ocr_progress "$ocr_idx" "$ocr_total" "$ocr_converted" "$ocr_skipped" "$rel_path" "$_ocr_page"
+          _ocr_page=""
+        done
+        printf '\n'
+        ok "${M}OCR${RESET} Completed: ${ocr_converted} converted, ${ocr_skipped} skipped"
+      fi
+    fi
+  fi
+
+  # Binary copyable pass (non-OCR files)
+  while IFS= read -r -d '' src_file; do
+    should_skip_source_file "$src_file" && continue
+    is_binary_copyable_file "$src_file" || continue
+    import_extension_selected "$(file_ext "$src_file")" || continue
+    rel_path="${src_file#"$source_path"/}"
+    dest_file="$dest_dir/$rel_path"
+    dest_parent="$(dirname "$dest_file")"
+    mkdir -p "$dest_parent"
+    if [[ -f "$dest_file" ]]; then
+      skipped=$((skipped + 1))
+    else
+      cp "$src_file" "$dest_file"
+      copied=$((copied + 1))
+    fi
+    processed=$((processed + 1))
+    render_copy_progress "$processed" "$total_files" "$copied" "$skipped" "$rel_path"
+  done < <(find "$source_path" -type f -print0 2>/dev/null)
+
+  COPY_COPIED_COUNT="$copied"
+  COPY_SKIPPED_COUNT="$skipped"
+  COPY_OCR_CONVERTED_COUNT="${ocr_converted:-0}"
+  COPY_OCR_SKIPPED_COUNT="${ocr_skipped:-0}"
+
+  printf '\n'
+  ok "Workspace source copy prepared in ${BOLD}$(dirname "$dest_dir")${RESET}"
+}
+
+choose_preferred_cli() {
+  local options=(
+    "$(option_spec "claude_code" "Claude Code" "run the terminal CLI in this workspace")"
+    "$(option_spec "claude_code_desktop" "Claude Code Desktop" "open the desktop app with the prompt ready")"
+    "$(option_spec "codex" "Codex" "run the Codex terminal CLI in this workspace")"
+    "$(option_spec "codex_app" "Codex App" "open the Codex app and paste the copied prompt")"
+    "$(option_spec "opencode" "OpenCode" "run the OpenCode CLI with the startup prompt")"
+    "$(option_spec "opencode_desktop" "OpenCode Desktop" "open OpenCode and paste the copied prompt")"
+    "$(option_spec "kilo" "Kilo" "run the Kilo terminal CLI in this workspace")"
+    "$(option_spec "other" "Other" "copy a generic launch command for another tool")"
+  )
+  prompt_choose "Preferred LLM CLI" "${options[@]}"
+}
+
+choose_import_batches() {
+  [[ ${#IMPORT_BATCH_EXTENSIONS[@]} -gt 0 ]] || return 0
+
+  local options=() i count ext
+  options+=("$(option_spec "__all__" "All supported files" "toggle every supported file type on or off")")
+  for i in "${!IMPORT_BATCH_EXTENSIONS[@]}"; do
+    ext="${IMPORT_BATCH_EXTENSIONS[$i]}"
+    count="${IMPORT_BATCH_COUNTS[$i]}"
+    local ocr_tag=""
+    if rapidocr_ocr_available 2>/dev/null; then
+      if [[ "$ext" == "pdf" ]] || ext_in_list "$ext" "$IMAGE_EXTENSIONS"; then
+        ocr_tag=" (OCR)"
+      fi
+    fi
+    options+=("$(option_spec "$ext" ".${ext}" "$(plural_count "$count" "file")${ocr_tag}")")
+  done
+
+  while true; do
+    note "Choose which file types to import into the workspace copy."
+    prompt_multi_choose "Selectable file-type batches" "${options[@]}" || return 1
+    SELECTED_IMPORT_EXTENSIONS=("${MULTI_CHOOSE_RESULTS[@]}")
+    if [[ ${#SELECTED_IMPORT_EXTENSIONS[@]} -gt 0 ]]; then
+      return 0
+    fi
+    warn "Select at least one file type to enable import."
+  done
+}
+
+choose_scan_action() {
+  local copyable_count="$1"
+  local options=()
+  if [[ "$copyable_count" -gt 0 ]]; then
+    options+=("$(option_spec "import" "Import these files into the workspace" "prepare a working copy for analysis")")
+  fi
+  options+=(
+    "$(option_spec "rescan" "Choose another source folder" "rescan a different folder before importing anything")"
+    "$(option_spec "cancel" "Cancel onboarding" "stop here without preparing a workspace copy")"
+  )
+  prompt_choose "Next step" "${options[@]}"
+}
+
+choose_handoff_action() {
+  local options=(
+    "$(option_spec "copy_command" "Copy launch command" "keep the command in your clipboard and run it yourself")"
+    "$(option_spec "run_now" "Run launch command now" "open the selected CLI immediately when supported")"
+  )
+  prompt_choose "Handoff action" "${options[@]}"
+}
+
+confirm_action() {
+  local prompt="$1" default="${2:-y}"
+  prompt_confirm "$prompt" "$default"
+}
+
+print_path_list() {
+  local title="$1"
+  shift
+  local count="$#" shown=0 path remaining
+  [[ "$count" -gt 0 ]] || return 0
+
+  info "${title}: ${count}"
+  for path in "$@"; do
+    shown=$((shown + 1))
+    if [[ "$shown" -gt 8 ]]; then
+      remaining=$((count - 8))
+      note "... ${remaining} more"
+      break
+    fi
+    note "$path"
+  done
+}
+
+write_setup_files() {
+  local root="$1" project_title="$2" source_path="$3" preferred_cli="$4"
+  local context="$root/system/context.md" config="$root/system/configuration.md"
+  local agents="$root/AGENTS.md" claude="$root/CLAUDE.md"
+  local safe_source claude_created="no"
+  safe_source="$(sanitize_yaml "$source_path")"
+
+  mkdir -p "$(dirname "$context")" "$(dirname "$config")"
+  cat > "$context" << CONTEXT_EOF
+---
+type: information
+agent: setup_cli
+description:
+  - Project blueprint filled during onboarding and startup.
+  - Agents read this to understand scope, source location, evidence rules, and researcher preferences.
+created: $TODAY
+updated: $TODAY
+setup_status: cli_started
+connects_to:
+  - AGENTS.md
+  - system/configuration.md
+  - system/startup.md
+  - logs/user_requests.md
+---
+
+# Information
+
+## Project
+- Title: ${project_title:-[project name]}
+- Description: not provided during fast setup; infer from the raw corpus during startup
+
+## Project Artifacts
+- none provided during fast setup
+
+## Sources
+- Source location: ${source_path:-[path]}
+- Main source types: [inferred during startup from the source material]
+- Expected incoming sources: [inferred during startup]
+
+## Research Vocabulary
+- Key actors / institutions / places: [inferred during startup]
+- Key concepts: [inferred during startup]
+- Sensitizing concepts, not evidence: [inferred during startup]
+- Theoretical frames, not forced labels: [inferred during startup]
+
+## Method And Evidence
+- Methods: [inferred during startup]
+- Claims require source paths.
+- L2 clues require Verifier checking before reporting.
+- External sources must stay labeled external unless moved into \`raw/\`.
+- External source policy: no (default; ask only if external access is needed)
+
+## Outputs
+- Start with navigation maps in maps/ and evidence-grounded answers unless the researcher requests another output.
+
+## Blind Spots
+- [identified during startup]
+
+## Researcher Preferences
+[stated or inferred during startup]
+
+## Preferred LLM CLI
+$preferred_cli
+CONTEXT_EOF
+
+  cat > "$config" << CONFIG_EOF
+---
+type: project_configuration
+agent: setup_cli
+description:
+  - Operating profile for the current Pilosa project or framework template.
+  - Agents read this first to learn source policy, protected paths, and setup status.
+created: $TODAY
+updated: $TODAY
+setup_status: cli_started
+---
+
+# Configuration
+
+Agents read this before major work.
+
+\`\`\`yaml
+workspace_type: research_framework
+research_mode: evolving_complex_corpus
+source_location: "$safe_source"
+source_mode: protected_append_only
+
+source_policy: internal_first
+active_corpus_path: raw/
+active_corpus_policy: raw_first_after_onboarding
+external_sources_allowed: no
+
+claim_standard: source_link_required
+l2_policy: verifier_required
+
+protected_paths:
+  - "$safe_source"
+  - context.md
+
+stale_after_days: 30
+preferred_llm_cli: "$preferred_cli"
+\`\`\`
+
+## Notes
+- This file was initialized by \`pilosa new\`.
+- The CLI collected: project name, source location, and preferred LLM CLI. It scanned the source location and transposed accepted files (text, native, and plain-text PDF imports) into raw/. Images, video, audio, and AGENTS.md control files were skipped.
+- After onboarding, the source location remains immutable original storage. Normal source-grounded work starts from raw/.
+- During startup, project description and helpful artifact URLs are optional. If absent, the LLM CLI agent records them as not provided, keeps external_sources_allowed at its default \`no\`, and infers working scope from the raw corpus.
+- When setup_status reaches workspace_started, the startup workflow has built the master dictionary, generated YAML headers, created multi-level navigation maps in maps/, and passed validation.
+- This file never grants permission to edit the source location or \`raw/\`.
+CONFIG_EOF
+
+  if [[ "$preferred_cli" == "Claude Code" && -f "$agents" ]]; then
+    cp "$agents" "$claude"
+    claude_created="yes"
+  fi
+
+  mkdir -p "$root/.obsidian/snippets"
+  cat > "$root/.obsidian/appearance.json" << 'APPEARANCE_EOF'
+{
+  "cssSnippets": [
+    "pilosa"
+  ]
+}
+APPEARANCE_EOF
+
+  ok "Setup files written"
+  note "$context"
+  note "$config"
+  [[ "$claude_created" == "yes" ]] && note "$claude"
+  note "$root/.obsidian/appearance.json"
+}
+
+write_onboarding_summary() {
+  local root="$1" project_title="$2" source_path="$3" preferred_cli="$4" handoff_action="$5" handoff_result="$6"
+  local summary_path="$root/.pilosa/onboarding-summary.md"
+  local ocr_mode="not_applicable"
+  if [[ "${SCAN_OCR_CONVERTIBLE_COUNT:-0}" -gt 0 ]]; then
+    if [[ "${COPY_OCR_CONVERTED_COUNT:-0}" -gt 0 ]]; then
+      ocr_mode="rapidocr_structured"
+    elif [[ "${COPY_OCR_SKIPPED_COUNT:-0}" -gt 0 ]]; then
+      ocr_mode="ocr_skipped"
+    elif rapidocr_ocr_available; then
+      ocr_mode="rapidocr_available"
+    else
+      ocr_mode="rapidocr_not_bundled"
+    fi
+  fi
+
+  cat > "$summary_path" << SUMMARY_EOF
+---
+type: onboarding_summary
+created: $TODAY
+updated: $TODAY
+---
+
+# Onboarding Summary
+
+## Workspace
+- Project: ${project_title}
+- Workspace: ${root}
+- Source location: ${source_path}
+
+## Scan Summary
+- Text-based files to rename to Markdown: ${SCAN_MARKDOWN_COUNT} ($(format_bytes "$SCAN_MARKDOWN_BYTES"))
+- Native-readable files to copy unchanged: ${SCAN_NATIVE_COUNT} ($(format_bytes "$SCAN_NATIVE_BYTES"))
+- PDFs and images available for OCR: ${SCAN_OCR_CONVERTIBLE_COUNT:-0} ($(format_bytes "${SCAN_OCR_CONVERTIBLE_BYTES:-0}"))
+- Videos skipped: ${SCAN_VIDEO_COUNT} ($(format_bytes "$SCAN_VIDEO_BYTES"))
+- Audio skipped: ${SCAN_AUDIO_COUNT} ($(format_bytes "$SCAN_AUDIO_BYTES"))
+- Unsupported or unknown files: ${SCAN_UNKNOWN_COUNT} ($(format_bytes "$SCAN_UNKNOWN_BYTES"))
+- Ignored files: ${SCAN_IGNORED_COUNT}
+
+## Workspace Import Result
+- Candidate files: ${COPY_TOTAL_COUNT:-0}
+- Selected extension batches: $(selected_import_extensions_label)
+- Files imported into workspace: ${COPY_COPIED_COUNT:-0}
+- Files skipped during import: ${COPY_SKIPPED_COUNT:-0}
+- OCR (RapidOCR) converted: ${COPY_OCR_CONVERTED_COUNT:-0}
+- OCR (RapidOCR) skipped: ${COPY_OCR_SKIPPED_COUNT:-0}
+- OCR mode: ${ocr_mode}
+
+## Handoff
+- Preferred CLI: ${preferred_cli}
+- Handoff action: ${handoff_action}
+- Handoff result: ${handoff_result}
+SUMMARY_EOF
+
+  ok "Onboarding summary written"
+  note "$summary_path"
+}
+
+startup_prompt_text() {
+  local project_title="$1" source_path="$2" preferred_cli="$3"
+  cat << PROMPT_EOF
+This is the Pilosa startup handoff. The user has completed pilosa new setup.
+
+Read these files first, in this order:
+1. AGENTS.md
+2. system/configuration.md
+3. system/context.md
+4. system/yaml_header_template.md
+
+The setup draft already contains:
+- Project name: ${project_title}
+- Source location: ${source_path} (already validated, files transposed to raw/ — images, video, audio, and AGENTS.md skipped)
+- Preferred LLM CLI: ${preferred_cli}
+
+Optional context not collected by fast setup:
+- Project description (if absent, infer from the raw corpus)
+- Helpful artifact URLs or file paths (if absent, record none provided)
+- External source policy defaults to no; ask only if external URL access is needed or the user requests external sources.
+
+Then execute system/startup.md. Specifically:
+- Phase 1: Verify onboarding completed (setup files exist, source location valid)
+- Phase 2: Index, Map, Validate — build the master dictionary, extract content-grounded fragments, generate YAML headers, write multi-level navigation maps, run serendipitous connection discovery, update workspace_index.md, run validation and retrieval tests
+- Set setup_status to workspace_started in both system/context.md and system/configuration.md
+- Write the startup report to agent_reports/
+
+Do not re-ask questions the CLI draft already answered. Do not stop after one index. Do not edit the source location or \`raw/\`.
+PROMPT_EOF
+}
+
+# ── OCR User Prompt ────────────────────────────────────────────────────────────
+
+# ── RapidOCR Functions ────────────────────────────────────────────────────────
+
+RAPIDOCR_VENDOR_DIR="${PILOSA_HOME:-$HOME/.pilosa}/vendor/rapidocr"
+RAPIDOCR_PLATFORM="${OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}-$(uname -m | sed 's/aarch64/arm64/')"
+
+rapidocr_ocr_available() {
+  local bin="${RAPIDOCR_VENDOR_DIR}/${RAPIDOCR_PLATFORM}/rapidocr-cli"
+  [[ -x "$bin" ]] && return 0
+  # Also check framework .bin/lib/vendor/ directory
+  local framework_bin="${FRAMEWORK_ROOT:-.}/.bin/lib/vendor/rapidocr-${RAPIDOCR_PLATFORM}/rapidocr-cli"
+  [[ -x "$framework_bin" ]] && return 0
+  return 1
+}
+
+rapidocr_ocr_bin() {
+  local bin="${RAPIDOCR_VENDOR_DIR}/${RAPIDOCR_PLATFORM}/rapidocr-cli"
+  if [[ -x "$bin" ]]; then
+    echo "$bin"
+    return
+  fi
+  local framework_bin="${FRAMEWORK_ROOT:-.}/.bin/lib/vendor/rapidocr-${RAPIDOCR_PLATFORM}/rapidocr-cli"
+  if [[ -x "$framework_bin" ]]; then
+    echo "$framework_bin"
+    return
+  fi
+  return 1
+}
+
+run_rapidocr_ocr() {
+  local input_file="$1" output_file="$2"
+  local ocr_bin
+  ocr_bin="$(rapidocr_ocr_bin)" || { echo "ERROR: RapidOCR not installed" >&2; return 1; }
+  "$ocr_bin" "$input_file" "$output_file"
+}
+
+is_rapidocr_image() {
+  local ext
+  ext="$(file_ext "$1")"
+  [[ -n "$ext" ]] && ext_in_list "$ext" "$IMAGE_EXTENSIONS"
+}
+
+is_rapidocr_pdf() {
+  local ext
+  ext="$(file_ext "$1")"
+  [[ -n "$ext" ]] && ext_in_list "$ext" "pdf"
+}
+
+# ── Image File Detection ──────────────────────────────────────────────────────
+
+IMAGE_EXTENSIONS="jpg|jpeg|png|gif|webp|heic|heif|tif|tiff|bmp|svg"
+
+prompt_ocr_choice() {
+  # Skip OCR prompt in non-interactive mode (piped input, CI, tests)
+  if [[ ! -t 0 ]]; then
+    SCAN_OCR_CHOICE="no"
+    return 0
+  fi
+
+  local total_ocr="${SCAN_OCR_CONVERTIBLE_COUNT:-0}"
+  
+  # Skip if no PDFs or images
+  [[ "$total_ocr" -gt 0 ]] || { SCAN_OCR_CHOICE="no"; return 0; }
+  
+  if rapidocr_ocr_available; then
+    echo ""
+    note "OCR Available: RapidOCR (bundled)"
+    note "  • Converts PDFs → structured Markdown with OCR"
+    note "  • Converts images → text via OCR (90+ languages)"
+    note "  • Runs 100% locally, no cloud needed"
+    echo ""
+    
+    if confirm "Would you like to OCR ${total_ocr} PDFs and images?"; then
+      SCAN_OCR_CHOICE="yes"
+    else
+      SCAN_OCR_CHOICE="no"
+      echo ""
+      warn "Skipping OCR: ${total_ocr} files will not be processed"
+    fi
+  else
+    warn "RapidOCR OCR not available for this platform"
+    SCAN_OCR_CHOICE="no"
+  fi
+}
+
+run_integrated_onboarding() {
+  local root="$1" project_title="$2" preselected_source="${3:-}"
+  local source_path="" preferred_cli preferred_cli_label startup_prompt launch_command handoff_action handoff_action_text handoff_result
+  local copyable_count estimated_bytes free_bytes scan_action source_prompt_shown=0
+
+  # ── Step 1: Source folder ─────────────────────────────────────────────
+  if [[ -n "$preselected_source" ]]; then
+    # Corpus was already selected during workspace creation — skip prompt
+    source_path="$preselected_source"
+    info "Source: ${BOLD}${source_path}${RESET}"
+  fi
+
+  while true; do
+    if [[ -z "$source_path" ]]; then
+      print_step 1 3 "Source files folder"
+      if [[ "$source_prompt_shown" -eq 0 ]]; then
+        note "Specify the folder containing your research materials (documents, PDFs, notes)."
+        note "These files will be copied into the workspace for analysis."
+        note "Nothing in the original folder is moved, renamed, or edited."
+      else
+        note "Choose another source folder and Pilosa will rescan it before writing anything."
+      fi
+      source_prompt_shown=1
+
+      while true; do
+        source_path="$(prompt_directory "Source folder (absolute path)" "" "e.g. /home/user/Documents/my-sources")"
+        source_path="$(normalize_path_input "$source_path")"
+        source_path="$(expand_home "$source_path")"
+        if [[ -z "$source_path" ]]; then
+          printf '  %s\n' "${R}Source folder is required.${RESET}" >&2
+        elif [[ ! -d "$source_path" ]]; then
+          printf '  %s\n' "${R}Source folder does not exist: $source_path${RESET}" >&2
+        else
+          break
+        fi
+      done
+      ok "Source: ${BOLD}${source_path}${RESET}"
+    fi
+
+    print_step 2 3 "Corpus scan and consent"
+    print_onboarding_preflight "$root"
+    scan_source "$source_path"
+    print_scan_summary
+
+    choose_import_batches || return 1
+
+    # Auto-detect OCR from selected extensions
+    SCAN_OCR_CHOICE="no"
+    if rapidocr_ocr_available; then
+      local _ext
+      for _ext in "${SELECTED_IMPORT_EXTENSIONS[@]}"; do
+        if [[ "$_ext" == "pdf" ]] || ext_in_list "$_ext" "$IMAGE_EXTENSIONS"; then
+          SCAN_OCR_CHOICE="yes"
+          break
+        fi
+      done
+    fi
+
+    copyable_count="$(selected_import_count)"
+    estimated_bytes="$(scan_copyable_bytes)"
+    free_bytes="$(available_disk_bytes "$root")"
+    if [[ "$free_bytes" -gt 0 ]]; then
+      if (( estimated_bytes > free_bytes )); then
+        warn "Estimated import size is $(format_bytes "$estimated_bytes"), but only $(format_bytes "$free_bytes") is free near the workspace."
+      else
+        note "Estimated import size: $(format_bytes "$estimated_bytes")"
+      fi
+    fi
+
+    echo ""
+    if [[ "$copyable_count" -gt 0 ]]; then
+      note "Ready to import ${copyable_count} files into the workspace. This does not modify your source."
+      note "Selected file types: $(selected_import_extensions_label)"
+    else
+      warn "No file types are selected for import."
+    fi
+    echo ""
+
+    [[ "$copyable_count" -gt 0 ]] || { warn "No workspace copy was prepared. Onboarding stopped after the scan."; return 1; }
+    break
+  done
+
+  copy_source "$source_path" "$root/raw"
+
+  print_step 3 3 "Startup handoff"
+  reset_terminal
+  preferred_cli="$(choose_preferred_cli)" || return 1
+  preferred_cli_label="$(preferred_cli_name "$preferred_cli")"
+  ok "CLI: ${BOLD}${preferred_cli_label}${RESET}"
+
+  write_setup_files "$root" "$project_title" "$source_path" "$preferred_cli_label"
+  sed -i.bak 's/setup_status: not_started/setup_status: cli_started/' "$root/.pilosa/workspace" 2>/dev/null || \
+  sed -i '' 's/setup_status: not_started/setup_status: cli_started/' "$root/.pilosa/workspace" 2>/dev/null || true
+  rm -f "$root/.pilosa/workspace.bak"
+
+  startup_prompt="$(startup_prompt_text "$project_title" "$source_path" "$preferred_cli_label")"
+  launch_command="$(build_launch_command "$root" "$preferred_cli" "$startup_prompt")"
+
+  print_box "Pilosa Startup Prompt Preview" <<< "$(prompt_preview <<< "$startup_prompt")"
+  print_box "Terminal Launch Command Preview" <<< "$(prompt_preview <<< "$launch_command")"
+
+  handoff_action="$(choose_handoff_action)" || return 1
+  handoff_action_text="$(handoff_action_label "$handoff_action")"
+  handoff_result="launch_command_copied"
+  if [[ "$handoff_action" == "run_now" ]]; then
+    run_cli_with_prompt "$root" "$preferred_cli" "$startup_prompt" || {
+      handoff_result="run_failed_command_copied"
+      warn "Could not run ${preferred_cli_label}. Copying the launch command instead."
+      copy_to_clipboard "$launch_command" && ok "Launch command copied to your clipboard." || print_box "Terminal Launch Command — full text" <<< "$launch_command"
+    }
+    [[ "$handoff_result" != "run_failed_command_copied" ]] && handoff_result="run_requested"
+  else
+    copy_to_clipboard "$launch_command" && ok "Launch command copied to your clipboard." || print_box "Terminal Launch Command — full text" <<< "$launch_command"
+  fi
+
+  write_onboarding_summary "$root" "$project_title" "$source_path" "$preferred_cli_label" "$handoff_action_text" "$handoff_result"
+}
+
+# ── framework manifest reader ──────────────────────────────────────────────
+# Reads framework-files.tsv and returns paths matching the given role filter.
+# Usage: read_manifest [framework|user_state|mixed_framework_user]
+read_manifest() {
+  local filter="${1:-}"
+  local tsv="${FRAMEWORK_ROOT}/.pilosa/framework-files.tsv"
+  [[ -f "$tsv" ]] || die "Framework manifest not found: $tsv"
+
+  while IFS=$'\t' read -r path role policy; do
+    [[ "$path" == "path" ]] && continue  # skip header
+    if [[ -z "$filter" || "$role" == "$filter" ]]; then
+      echo "$path"
+    fi
+  done < "$tsv"
+}
+
+# ── detect installed LLM CLIs ──────────────────────────────────────────────
+detect_llm_clis() {
+  local clis
+  clis=()
+  command -v claude >/dev/null 2>&1 && clis+=("Claude Code")
+  command -v codex >/dev/null 2>&1 && clis+=("Codex")
+  command -v opencode >/dev/null 2>&1 && clis+=("OpenCode")
+  command -v kilo >/dev/null 2>&1 && clis+=("Kilo")
+  if [[ ${#clis[@]} -eq 0 ]]; then
+    clis+=("Other (manual)")
+  fi
+  printf '%s\n' "${clis[@]}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMAND: uninstall
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_uninstall() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-color) R="" G="" B="" Y="" C="" M="" DIM="" BOLD="" RESET=""; shift ;;
+      --yes|-y) FORCE_YES="1"; shift ;;
+      --help|-h) echo "Usage: pilosa uninstall [--yes]" >&2; return 0 ;;
+      -*) die "Unknown option: $1" ;;
+      *) shift ;;
+    esac
+  done
+
+  local bin_dir="${PILOSA_BIN_DIR:-$HOME/.local/bin}"
+
+  header "Pilosa — Uninstall"
+
+  if [[ ! -d "$PILOSA_HOME" ]]; then
+    info "Pilosa is not installed (${PILOSA_HOME} not found)."
+    [[ -f "$bin_dir/pilosa" ]] && info "Found stray shim at ${bin_dir}/pilosa" || return 0
+  fi
+
+  echo ""
+  info "This will remove:"
+  [[ -d "$PILOSA_HOME" ]] && info "  ${PILOSA_HOME}/  (framework + binary)"
+  [[ -f "$bin_dir/pilosa" ]] && info "  ${bin_dir}/pilosa  (shim)"
+  echo ""
+  warn "Research workspaces are NOT affected."
+  echo ""
+
+  if [[ "${FORCE_YES:-}" != "1" ]]; then
+    if ! confirm "Remove Pilosa from this system?"; then
+      info "Uninstall cancelled."
+      return 0
+    fi
+  fi
+
+  [[ -d "$PILOSA_HOME" ]] && rm -rf "$PILOSA_HOME" && ok "Removed ${PILOSA_HOME}"
+  [[ -f "$bin_dir/pilosa" ]] && rm -f "$bin_dir/pilosa" && ok "Removed ${bin_dir}/pilosa"
+
+  divider
+  ok "Pilosa uninstalled."
+  echo ""
+  info "Any research workspaces you created are still intact."
+  info "To remove a workspace, delete its directory."
+  echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMAND: help
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_help() {
+  header "Pilosa — Research Framework CLI"
+
+  printf '  %s\n' "${BOLD}Usage:${RESET}"
+  printf '    %s\n' "pilosa new [directory]    Create a new workspace and run onboarding"
+  printf '    %s\n' "pilosa onboard [dir]     Run onboarding on an existing workspace"
+  printf '    %s\n' "pilosa update [dir]      Update workspace framework files"
+  printf '    %s\n' "pilosa upgrade           Upgrade Pilosa CLI to latest release"
+  printf '    %s\n' "pilosa check [directory] Validate workspace integrity"
+  printf '    %s\n' "pilosa sync              Sync agent and skill mirrors from canonical"
+  printf '    %s\n' "pilosa uninstall         Remove Pilosa from this system"
+  printf '    %s\n' "pilosa help              Show this help"
+  printf '\n'
+
+  # Detect workspace
+  if [[ -f ".pilosa/workspace" ]]; then
+    local fw_version project_name setup_status
+    fw_version="$(grep 'framework_version:' .pilosa/workspace | awk '{print $2}')"
+    project_name="$(grep 'project_name:' .pilosa/workspace | awk '{print $2}')"
+    setup_status="$(grep 'setup_status:' .pilosa/workspace | awk '{print $2}')"
+    divider
+    printf '\n  %s %s\n' "${BOLD}Current workspace:${RESET}" "${project_name:-unknown}"
+    printf '  %s %s\n' "${DIM}framework:${RESET}" "${fw_version:-unknown}"
+    printf '  %s %s\n' "${DIM}status:${RESET}" "${setup_status:-unknown}"
+    printf '\n'
+  fi
+
+  # Detect LLM CLIs
+  local clis_str clis_arr
+  clis_str="$(detect_llm_clis)"
+  if [[ -n "$clis_str" ]]; then
+    divider
+    printf '\n  %s\n' "${BOLD}Detected LLM CLIs:${RESET}"
+    while IFS= read -r cli; do
+      printf '    %s %s\n' "${G}✓${RESET}" "$cli"
+    done <<< "$clis_str"
+    printf '\n'
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMAND: onboard
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_onboard() {
+  local workspace_path=""
+  local source_dir=""
+  local onboard_args
+  onboard_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-color) R="" G="" B="" Y="" C="" M="" DIM="" BOLD="" RESET=""; shift ;;
+      --gum)     USE_GUM="1"; shift ;;
+      --no-gum)  USE_GUM="0"; shift ;;
+      --source-dir) source_dir="$2"; shift 2 ;;
+      --help|-h)
+        echo "Usage: pilosa onboard [workspace-directory] [options]" >&2
+        echo "  --source-dir PATH  Pre-select source folder (skip prompt)" >&2
+        echo "  --gum              Use interactive Gum prompts" >&2
+        echo "  --no-gum           Use plain shell prompts" >&2
+        return 0
+        ;;
+      -*) die "Unknown option: $1" ;;
+      *) onboard_args+=("$1"); shift ;;
+    esac
+  done
+
+  # Resolve workspace path
+  if [[ -n "$workspace_path" ]]; then
+    workspace_path="$(require_workspace "$workspace_path")" || return $?
+  else
+    workspace_path="$(require_workspace)" || return $?
+  fi
+  cd "$workspace_path" || die "Cannot change to workspace: $workspace_path"
+
+  # Extract existing project name from workspace metadata, or prompt
+  local project_name
+  project_name="$(grep 'project_name:' "$workspace_path/.pilosa/workspace" 2>/dev/null | sed 's/project_name: *//' | head -1 || echo "")"
+  if [[ -z "$project_name" ]]; then
+    local default_name
+    default_name="$(basename "$workspace_path")"
+    project_name="$(prompt_input "Project name" "$default_name")"
+    sed -i.bak "s/project_name:.*/project_name: ${project_name}/" "$workspace_path/.pilosa/workspace" 2>/dev/null || \
+    sed -i '' "s/project_name:.*/project_name: ${project_name}/" "$workspace_path/.pilosa/workspace" 2>/dev/null || true
+    rm -f "$workspace_path/.pilosa/workspace.bak"
+  fi
+
+  # If no --source-dir, read source_location from workspace metadata
+  if [[ -z "$source_dir" ]]; then
+    source_dir="$(grep 'source_location:' "$workspace_path/.pilosa/workspace" 2>/dev/null | sed 's/source_location: *//' | head -1 || echo "")"
+    if [[ -n "$source_dir" && -d "$source_dir" ]]; then
+      info "Previous source location found: ${source_dir}"
+    elif [[ -n "$source_dir" && ! -d "$source_dir" ]]; then
+      warn "Previous source location no longer exists: ${source_dir}"
+      source_dir=""
+    fi
+  fi
+
+  run_integrated_onboarding "$workspace_path" "$project_name" "$source_dir"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMAND: new
+# ═══════════════════════════════════════════════════════════════════════════
+# Flow: select corpus root → auto-create sibling workspace → project name → onboard
+cmd_new() {
+  header "Pilosa — New Workspace"
+
+  local corpus_path=""
+  local workspace_path=""
+  local new_args
+  new_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) die "--force is not supported for pilosa new." ;;
+      --numbered) NUMBERED="1"; shift ;;
+      --no-color) R="" G="" B="" Y="" C="" M="" DIM="" BOLD="" RESET=""; shift ;;
+      --gum)     USE_GUM="1"; shift ;;
+      --no-gum)  USE_GUM="0"; shift ;;
+      --help|-h)
+        printf '  %s\n' "Usage: pilosa new [corpus-directory] [options]"
+        printf '    %s\n' "  --numbered   Force numbered menus instead of arrow-key menus"
+        printf '    %s\n' "  --no-color   Disable colored output"
+        printf '    %s\n' "  --gum        Use interactive Gum prompts"
+        printf '    %s\n' "  --no-gum     Use plain shell prompts"
+        return 0
+        ;;
+      *)
+        new_args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  # ── Step 1: Corpus root ────────────────────────────────────────────────
+  if [[ -n "${new_args[0]:-}" ]]; then
+    corpus_path="$(expand_home "${new_args[0]}")"
+  else
+    note "Where is your research corpus?"
+    note "This is the folder containing your source documents, PDFs, notes, etc."
+    note "A sibling workspace folder will be created next to it."
+    while true; do
+      corpus_path="$(prompt_input "Corpus folder" "" "e.g. ~/Documents/my-research")"
+      corpus_path="$(normalize_path_input "$corpus_path")"
+      corpus_path="$(expand_home "$corpus_path")"
+      if [[ -z "$corpus_path" ]]; then
+        printf '  %s\n' "${R}Corpus folder is required.${RESET}" >&2
+      elif [[ ! -d "$corpus_path" ]]; then
+        printf '  %s\n' "${R}Not a directory: $corpus_path${RESET}" >&2
+      else
+        break
+      fi
+    done
+  fi
+
+  # Validate corpus
+  corpus_path="$(cd "$corpus_path" 2>/dev/null && pwd)"
+  ok "Corpus: ${BOLD}${corpus_path}${RESET}"
+
+  # ── Step 2: Auto-generate workspace path ────────────────────────────────
+  local corpus_name
+  corpus_name="$(basename "$corpus_path")"
+  local parent_dir
+  parent_dir="$(dirname "$corpus_path")"
+  local suffix="-pilosa"
+  local candidate="${parent_dir}/${corpus_name}${suffix}"
+  local n=1
+  while [[ -e "$candidate" ]]; do
+    n=$((n + 1))
+    candidate="${parent_dir}/${corpus_name}${suffix}-${n}"
+  done
+  workspace_path="$candidate"
+  ok "Workspace: ${BOLD}${workspace_path}${RESET}"
+
+  # ── Step 3: Project name ────────────────────────────────────────────────
+  local project_name=""
+  local default_name
+  default_name="$corpus_name"
+
+  while [[ -z "$project_name" ]]; do
+    project_name="$(prompt_input "Project name" "$default_name")"
+    [[ -z "$project_name" ]] && printf '  %s\n' "${R}Project name is required.${RESET}" >&2
+  done
+  project_name="${project_name:-$default_name}"
+  ok "Project:   ${BOLD}${project_name}${RESET}"
+
+  # ── Step 4: Create workspace and copy framework ──────────────────────────
+  if [[ -z "$FRAMEWORK_ROOT" ]]; then
+    die "Framework not found. Is Pilosa installed? Check ${PILOSA_HOME}/versions/"
+  fi
+  if [[ ! -f "${FRAMEWORK_ROOT}/.pilosa/framework-files.tsv" ]]; then
+    die "Framework manifest not found: ${FRAMEWORK_ROOT}/.pilosa/framework-files.tsv"
+  fi
+
+  mkdir -p "$workspace_path/.pilosa"
+
+  local source_framework_version
+  source_framework_version="$(framework_version "$FRAMEWORK_ROOT")"
+
+  # Copy all framework-owned files
+  while IFS=$'\t' read -r path role policy; do
+    [[ "$path" == "path" ]] && continue
+    is_release_managed_role "$role" || continue
+
+    local src="${FRAMEWORK_ROOT}/${path}"
+    local dst="${workspace_path}/${path}"
+
+    if [[ -d "$src" ]]; then
+      mkdir -p "$dst"
+      cp -a "$src"/. "$dst"/ 2>/dev/null || true
+    elif [[ -f "$src" ]]; then
+      mkdir -p "$(dirname "$dst")"
+      cp -a "$src" "$dst"
+    fi
+  done < "${FRAMEWORK_ROOT}/.pilosa/framework-files.tsv"
+
+  # Create empty user-state directories with .gitkeep
+  for dir in raw maps logs agent_reports .trash; do
+    mkdir -p "$workspace_path/$dir"
+    touch "$workspace_path/$dir/.gitkeep"
+  done
+  if [[ ! -f "$workspace_path/logs/session_metrics.tsv" ]]; then
+    printf 'date\tsession_id\tagent\troute\toperation\tquery_label\tdirs_seen\tmaps_read\traw_matches\traw_files_read\treports_written\toutput_path\n' > "$workspace_path/logs/session_metrics.tsv"
+  fi
+
+  ok "Framework copied"
+
+  # ── Step 5: Write workspace metadata ────────────────────────────────────
+  cat > "$workspace_path/.pilosa/workspace" << EOF
+workspace_version: 1
+framework_version: ${source_framework_version}
+created: ${TODAY}
+project_name: ${project_name}
+source_location: ${corpus_path}
+setup_status: not_started
+EOF
+
+  # Generate manifest with checksums
+  printf 'path\tsha256\n' > "$workspace_path/.pilosa/manifest.tsv"
+  while IFS=$'\t' read -r path role policy; do
+    [[ "$path" == "path" ]] && continue
+    is_release_managed_role "$role" || continue
+
+    local full_path="${workspace_path}/${path}"
+    if [[ -f "$full_path" ]]; then
+      local hash
+      hash="$(sha256_file "$full_path" 2>/dev/null || echo "none")"
+      printf '%s\t%s\n' "$path" "$hash" >> "$workspace_path/.pilosa/manifest.tsv"
+    elif [[ -d "$full_path" ]]; then
+      printf '%s\tdir\n' "$path" >> "$workspace_path/.pilosa/manifest.tsv"
+    fi
+  done < "${FRAMEWORK_ROOT}/.pilosa/framework-files.tsv"
+
+  ok "Metadata written"
+
+  # Register workspace in global registry
+  register_workspace "$workspace_path" "$project_name"
+
+  # ── Step 6: Onboarding (continuous flow) ────────────────────────────────
+  run_integrated_onboarding "$workspace_path" "$project_name" "$corpus_path"
+
+  ok "Workspace ready: ${BOLD}${workspace_path}${RESET}"
+  printf '\n'
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMAND: update
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_update() {
+  header "Pilosa — Update Workspace"
+
+  local workspace_path=""
+  local target_version="latest"
+  local release_dir=""
+  local dry_run=0
+  local auto_yes=0
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --version) target_version="$2"; shift 2 ;;
+      --release-dir) release_dir="$(expand_home "$2")"; shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      --yes|-y) auto_yes=1; shift ;;
+      --no-color) R="" G="" B="" Y="" C="" M="" DIM="" BOLD="" RESET=""; shift ;;
+      --gum)     USE_GUM="1"; shift ;;
+      --no-gum)  USE_GUM="0"; shift ;;
+      --help|-h)
+        printf '  %s\n' "Usage: pilosa update [workspace] [options]"
+        printf '    %s\n' "  --version X.Y.Z   Target framework version"
+        printf '    %s\n' "  --release-dir DIR Use a local dist/vX.Y.Z directory"
+        printf '    %s\n' "  --dry-run         Show what would change without writing"
+        printf '    %s\n' "  --yes             Apply the shown plan without confirmation prompts"
+        printf '    %s\n' "  --no-color        Disable colored output"
+        printf '    %s\n' "  --gum             Use interactive Gum prompts"
+        printf '    %s\n' "  --no-gum          Use plain shell confirmations"
+        return 0
+        ;;
+      --*)
+        die "Unknown update option: $1"
+        ;;
+      *)
+        if [[ -z "$workspace_path" ]]; then
+          workspace_path="$(expand_home "$1")"
+        else
+          die "Unexpected extra workspace argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  # Resolve workspace path
+  if [[ -n "$workspace_path" ]]; then
+    workspace_path="$(require_workspace "$workspace_path")" || return $?
+  else
+    workspace_path="$(require_workspace)" || return $?
+  fi
+  cd "$workspace_path" || die "Cannot change to workspace: $workspace_path"
+
+  local fw_version project_name
+  fw_version="$(grep 'framework_version:' "$workspace_path/.pilosa/workspace" | awk '{print $2}')"
+  project_name="$(grep 'project_name:' "$workspace_path/.pilosa/workspace" | awk '{print $2}')"
+
+  ok "Workspace: ${BOLD}${project_name:-unknown}${RESET}"
+  info "Current framework version: ${fw_version:-unknown}"
+
+  # Validate manifest exists
+  if [[ ! -f "$workspace_path/.pilosa/manifest.tsv" ]]; then
+    die "Manifest not found: $workspace_path/.pilosa/manifest.tsv"
+  fi
+
+  # ── Load release framework ─────────────────────────────────────────────
+  local tmpdir release_info resolved_version release_root release_manifest
+  tmpdir="$(mktemp -d)"
+  release_info="$(prepare_release_framework "$target_version" "$release_dir" "$tmpdir")"
+  resolved_version="${release_info%%$'\t'*}"
+  release_root="${release_info#*$'\t'}"
+  release_manifest="${release_root}/.pilosa/framework-files.tsv"
+
+  info "Target version: ${resolved_version}"
+
+  # ── Compare checksums ──────────────────────────────────────────────────
+  divider
+  printf '\n  %sComparing framework files...%s\n\n' "${BOLD}" "${RESET}"
+
+  local modified=0
+  local unchanged=0
+  local missing=0
+  local replaced=0
+  local added=0
+  local sidecars=0
+  local directory_updates=0
+  local retired_removed=0
+  local retired_kept=0
+  local skip_retired_cleanup=0
+  local clean_replace_paths
+  clean_replace_paths=()
+  local forced_replace_paths
+  forced_replace_paths=()
+  local sidecar_paths
+  sidecar_paths=()
+  local add_paths
+  add_paths=()
+  local directory_paths
+  directory_paths=()
+  local retired_remove_paths
+  retired_remove_paths=()
+  local retired_keep_paths
+  retired_keep_paths=()
+
+  while IFS=$'\t' read -r path role policy; do
+    [[ "$path" == "path" ]] && continue
+    is_release_managed_role "$role" || continue
+
+    local current_hash stored_hash
+    local file_path="${workspace_path}/${path}"
+    local src="${release_root}/${path}"
+    [[ -e "$src" ]] || continue
+
+    if [[ -d "$src" ]]; then
+      directory_paths+=("$path")
+      if [[ -d "$file_path" ]]; then
+        unchanged=$((unchanged + 1))
+      else
+        missing=$((missing + 1))
+      fi
+    elif [[ "$policy" == "always_replace" ]]; then
+      if [[ -e "$file_path" ]]; then
+        forced_replace_paths+=("$path")
+        unchanged=$((unchanged + 1))
+      else
+        missing=$((missing + 1))
+        add_paths+=("$path")
+      fi
+    elif [[ -f "$file_path" ]]; then
+      current_hash="$(sha256_file "$file_path" 2>/dev/null || echo "none")"
+      stored_hash="$(manifest_hash "$workspace_path/.pilosa/manifest.tsv" "$path")"
+
+      if [[ "$current_hash" == "$stored_hash" ]]; then
+        clean_replace_paths+=("$path")
+        unchanged=$((unchanged + 1))
+      elif [[ "$current_hash" == "none" ]]; then
+        warn "Cannot compute checksum: $path"
+      else
+        sidecar_paths+=("$path")
+        modified=$((modified + 1))
+      fi
+    else
+      missing=$((missing + 1))
+      add_paths+=("$path")
+    fi
+  done < "$release_manifest"
+
+  local retired_manifest="${release_root}/.pilosa/retired-framework-files.tsv"
+  if [[ -f "$retired_manifest" ]]; then
+    while IFS=$'\t' read -r path reason; do
+      [[ "$path" == "path" ]] && continue
+
+      local dst="${workspace_path}/${path}"
+      [[ -f "$dst" ]] || continue
+
+      local current_hash stored_hash
+      current_hash="$(sha256_file "$dst" 2>/dev/null || echo "none")"
+      stored_hash="$(manifest_hash "$workspace_path/.pilosa/manifest.tsv" "$path")"
+
+      if [[ -n "$stored_hash" && "$current_hash" == "$stored_hash" ]]; then
+        retired_remove_paths+=("$path")
+      else
+        retired_keep_paths+=("$path")
+      fi
+    done < "$retired_manifest"
+  fi
+
+  printf '\n'
+  info "Workspace user data is not touched: raw corpus files, logs/user_requests.md, context, configuration, dictionary, and workspace index stay in place."
+  [[ ${#clean_replace_paths[@]} -gt 0 ]] && print_path_list "Clean framework files to replace" "${clean_replace_paths[@]}"
+  [[ ${#forced_replace_paths[@]} -gt 0 ]] && print_path_list "Forced framework files to replace" "${forced_replace_paths[@]}"
+  [[ ${#sidecar_paths[@]} -gt 0 ]] && print_path_list "Locally modified framework files to keep with .pilosa-new sidecars" "${sidecar_paths[@]}"
+  [[ ${#add_paths[@]} -gt 0 ]] && print_path_list "New framework files to add" "${add_paths[@]}"
+  [[ ${#directory_paths[@]} -gt 0 ]] && print_path_list "Framework directories to refresh recursively" "${directory_paths[@]}"
+  [[ ${#retired_remove_paths[@]} -gt 0 ]] && print_path_list "Retired clean framework files to remove" "${retired_remove_paths[@]}"
+  [[ ${#retired_keep_paths[@]} -gt 0 ]] && print_path_list "Retired modified framework files to leave in place" "${retired_keep_paths[@]}"
+
+  if [[ $modified -gt 0 ]]; then
+    warn "Your modified framework files stay unchanged. The release copy is written beside each one as .pilosa-new."
+  fi
+  if [[ ${#forced_replace_paths[@]} -gt 0 ]]; then
+    warn "Forced replacements can overwrite local edits. Keep this policy only for files that must track the framework."
+  fi
+  if [[ ${#directory_paths[@]} -gt 0 ]]; then
+    warn "Directory refreshes copy release contents recursively into existing framework directories."
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    printf '\n  %sDry run — no files changed.%s\n\n' "${DIM}" "${RESET}"
+    rm -rf "$tmpdir"
+    return 0
+  fi
+
+  # ── Confirm ─────────────────────────────────────────────────────────────
+  if [[ "$auto_yes" -ne 1 ]]; then
+    if [[ ${#sidecar_paths[@]} -gt 0 ]]; then
+      if ! confirm_action "Keep local framework edits and write release copies as .pilosa-new sidecars?" "y"; then
+        printf '\n  %sUpdate cancelled.%s\n\n' "${DIM}" "${RESET}"
+        rm -rf "$tmpdir"
+        return 0
+      fi
+    fi
+
+    if [[ ${#forced_replace_paths[@]} -gt 0 ]]; then
+      if ! confirm_action "Replace forced framework files listed above?" "y"; then
+        printf '\n  %sUpdate cancelled.%s\n\n' "${DIM}" "${RESET}"
+        rm -rf "$tmpdir"
+        return 0
+      fi
+    fi
+
+    if [[ ${#directory_paths[@]} -gt 0 ]]; then
+      if ! confirm_action "Refresh framework directories recursively?" "y"; then
+        printf '\n  %sUpdate cancelled.%s\n\n' "${DIM}" "${RESET}"
+        rm -rf "$tmpdir"
+        return 0
+      fi
+    fi
+
+    if [[ ${#retired_remove_paths[@]} -gt 0 ]]; then
+      if ! confirm_action "Remove retired clean framework files listed above?" "y"; then
+        skip_retired_cleanup=1
+        warn "Retired clean framework files will be left in place."
+      fi
+    fi
+
+    if ! confirm_action "Apply this Pilosa framework update now?" "n"; then
+      printf '\n  %sUpdate cancelled.%s\n\n' "${DIM}" "${RESET}"
+      rm -rf "$tmpdir"
+      return 0
+    fi
+  else
+    note "--yes supplied: applying the plan without interactive confirmations."
+  fi
+
+  # ── Execute update ──────────────────────────────────────────────────────
+  divider
+  printf '\n  %sApplying update...%s\n\n' "${BOLD}" "${RESET}"
+
+  while IFS=$'\t' read -r path role policy; do
+    [[ "$path" == "path" ]] && continue
+    is_release_managed_role "$role" || continue
+
+    local src="${release_root}/${path}"
+    local dst="${workspace_path}/${path}"
+
+    if [[ -f "$src" ]]; then
+      local current_hash stored_hash
+      if [[ "$policy" == "always_replace" ]]; then
+        mkdir -p "$(dirname "$dst")"
+        cp -a "$src" "$dst"
+        replaced=$((replaced + 1))
+        ok "Replaced: $path"
+      elif [[ -f "$dst" ]]; then
+        current_hash="$(sha256_file "$dst" 2>/dev/null || echo "none")"
+        stored_hash="$(manifest_hash "$workspace_path/.pilosa/manifest.tsv" "$path")"
+
+        if [[ "$current_hash" == "$stored_hash" ]]; then
+          # Safe to replace
+          cp -a "$src" "$dst"
+          replaced=$((replaced + 1))
+          ok "Replaced: $path"
+        else
+          # Conflict — user modified it
+          local sidecar
+          sidecar="$(next_sidecar_path "$dst")"
+          cp -a "$src" "$sidecar"
+          sidecars=$((sidecars + 1))
+          warn "Conflict: $path → wrote ${sidecar#$workspace_path/}"
+        fi
+      else
+        # New file
+        mkdir -p "$(dirname "$dst")"
+        cp -a "$src" "$dst"
+        added=$((added + 1))
+        ok "Added: $path"
+      fi
+    elif [[ -d "$src" ]]; then
+      mkdir -p "$dst"
+      cp -a "$src"/. "$dst"/ 2>/dev/null || true
+      directory_updates=$((directory_updates + 1))
+      ok "Updated: $path/"
+    fi
+  done < "$release_manifest"
+
+  # ── Remove explicitly retired framework files ───────────────────────────
+  if [[ "$skip_retired_cleanup" -eq 0 && -f "$retired_manifest" ]]; then
+    while IFS=$'\t' read -r path reason; do
+      [[ "$path" == "path" ]] && continue
+
+      local dst="${workspace_path}/${path}"
+      [[ -f "$dst" ]] || continue
+
+      local current_hash stored_hash
+      current_hash="$(sha256_file "$dst" 2>/dev/null || echo "none")"
+      stored_hash="$(manifest_hash "$workspace_path/.pilosa/manifest.tsv" "$path")"
+
+      if [[ -n "$stored_hash" && "$current_hash" == "$stored_hash" ]]; then
+        rm -f "$dst"
+        retired_removed=$((retired_removed + 1))
+        ok "Removed retired: $path"
+      else
+        retired_kept=$((retired_kept + 1))
+        warn "Retired file modified locally, left in place: $path"
+      fi
+    done < "$retired_manifest"
+  fi
+
+  # ── Update manifest ─────────────────────────────────────────────────────
+  cp "$workspace_path/.pilosa/manifest.tsv" "$workspace_path/.pilosa/manifest.tsv.bak"
+  printf 'path\tsha256\n' > "$workspace_path/.pilosa/manifest.tsv"
+  while IFS=$'\t' read -r path role policy; do
+    [[ "$path" == "path" ]] && continue
+    is_release_managed_role "$role" || continue
+
+    local release_path="${release_root}/${path}"
+    local full_path="${workspace_path}/${path}"
+    if [[ -f "$release_path" ]]; then
+      local current_hash stored_hash release_hash
+      release_hash="$(sha256_file "$release_path" 2>/dev/null || echo "none")"
+      stored_hash="$(manifest_hash "$workspace_path/.pilosa/manifest.tsv.bak" "$path" 2>/dev/null || true)"
+      if [[ "$policy" == "always_replace" || ! -f "$full_path" ]]; then
+        printf '%s\t%s\n' "$path" "$release_hash" >> "$workspace_path/.pilosa/manifest.tsv"
+      else
+        current_hash="$(sha256_file "$full_path" 2>/dev/null || echo "none")"
+        if [[ "$current_hash" == "$release_hash" ]]; then
+          printf '%s\t%s\n' "$path" "$release_hash" >> "$workspace_path/.pilosa/manifest.tsv"
+        else
+          # Preserve the old clean hash so unresolved conflicts stay protected.
+          printf '%s\t%s\n' "$path" "${stored_hash:-$release_hash}" >> "$workspace_path/.pilosa/manifest.tsv"
+        fi
+      fi
+    elif [[ -d "$release_path" && -d "$full_path" ]]; then
+      printf '%s\tdir\n' "$path" >> "$workspace_path/.pilosa/manifest.tsv"
+    fi
+  done < "$release_manifest"
+  rm -f "$workspace_path/.pilosa/manifest.tsv.bak"
+
+  # Update workspace version
+  sed -i.bak "s/framework_version: .*/framework_version: ${resolved_version}/" "$workspace_path/.pilosa/workspace" 2>/dev/null || \
+  sed -i '' "s/framework_version: .*/framework_version: ${resolved_version}/" "$workspace_path/.pilosa/workspace" 2>/dev/null || true
+  rm -f "$workspace_path/.pilosa/workspace.bak"
+  rm -rf "$tmpdir"
+
+  divider
+  ok "Update complete."
+  info "Files replaced: $replaced"
+  info "Files added: $added"
+  info "Directories updated: $directory_updates"
+  info "Retired files removed: $retired_removed"
+  [[ $sidecars -gt 0 ]] && warn "Sidecars written: $sidecars"
+  [[ $retired_kept -gt 0 ]] && warn "Retired files left in place because they were modified: $retired_kept"
+  printf '\n'
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMAND: check
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_check() {
+  local provided_path="${1:-}"
+  
+  # Resolve workspace path
+  local workspace_path
+  if [[ -n "$provided_path" ]]; then
+    workspace_path="$(require_workspace "$provided_path")" || return $?
+  else
+    workspace_path="$(require_workspace)" || return $?
+  fi
+  cd "$workspace_path" || die "Cannot change to workspace: $workspace_path"
+
+  header "Pilosa — Workspace Check"
+
+  local failures
+  failures=()
+  local warnings
+  warnings=()
+
+  # ── required files ────────────────────────────────────────────────
+  local required_files
+  required_files=(
+    "AGENTS.md"
+    "system/configuration.md"
+    "system/startup.md"
+    "system/context.md"
+    "system/yaml_header_template.md"
+    ".pilosa/framework-files.tsv"
+  )
+  for file in "${required_files[@]}"; do
+    [[ -f "$workspace_path/$file" ]] || failures+=("Missing $file")
+  done
+
+  local config startup_text
+  config="$(< "$workspace_path/system/configuration.md")"
+  local blueprint
+  blueprint="$(< "$workspace_path/system/context.md")"
+  startup_text="${config}${blueprint}"
+
+  # ── placeholder checks ────────────────────────────────────────────
+  for marker in "[path]" "[project name]" "[filled by CLI onboarding]" "[inferred during startup]" "[identified during startup]" "[filled by startup]"; do
+    if [[ "$startup_text" == *"$marker"* ]]; then
+      failures+=("Required placeholder remains: $marker")
+    fi
+  done
+
+  # ── setup_status ──────────────────────────────────────────────────
+  if [[ "$startup_text" == *"setup_status: cli_started"* ]]; then
+    failures+=("setup_status is still cli_started; run the workspace startup agent.")
+  fi
+  if [[ "$startup_text" != *"setup_status: workspace_started"* ]]; then
+    warnings+=("setup_status: workspace_started was not found.")
+  fi
+
+  # ── source location ───────────────────────────────────────────────
+  local source_path
+  source_path="$(echo "$config" | sed -n 's/.*source_location: *["'"'"']*\([^"'"'"']*\)["'"'"']*.*/\1/p' | head -1)"
+  if [[ -z "$source_path" || "$source_path" == "[path]" ]]; then
+    failures+=("source_location is missing or still a placeholder.")
+  else
+    local local_path="$source_path"
+    [[ ! -d "$local_path" ]] && local_path="$workspace_path/$source_path"
+    [[ ! -d "$local_path" ]] && failures+=("Source location does not exist: $source_path")
+  fi
+
+  # ── external policy ───────────────────────────────────────────────
+  if ! echo "$config" | grep -qE "external_sources_allowed: *(yes|no)"; then
+    failures+=("external_sources_allowed is missing or invalid.")
+  fi
+
+  # ── workspace index and dictionary ────────────────────────────────
+  if [[ "$startup_text" == *"setup_status: workspace_started"* ]]; then
+    for required_file in "system/workspace_index.md" "system/dictionary.md"; do
+      if [[ ! -f "$workspace_path/$required_file" ]]; then
+        failures+=("Missing required file: $required_file")
+      elif [[ ! -s "$workspace_path/$required_file" ]]; then
+        failures+=("Empty required file: $required_file")
+      fi
+    done
+  fi
+
+  # ── obsidian files ────────────────────────────────────────────────
+  if [[ ! -f "$workspace_path/.obsidian/appearance.json" ]]; then
+    warnings+=("Missing .obsidian/appearance.json")
+  fi
+  if [[ ! -d "$workspace_path/.obsidian/snippets" ]]; then
+    warnings+=("Missing .obsidian/snippets/")
+  fi
+
+  # ── maps validation ────────────────────────────────────────────────
+  local maps_dir="$workspace_path/maps"
+  if [[ "$startup_text" == *"setup_status: workspace_started"* ]]; then
+    if [[ ! -d "$maps_dir" ]]; then
+      failures+=("Missing maps directory: maps")
+    else
+      local has_overview=false
+      shopt -s nullglob
+      for map_file in "$maps_dir"/*.md; do
+        local map_basename="$(basename "$map_file")"
+        [[ "$map_basename" == "AGENTS.md" || "$map_basename" == "map_template.md" || "$map_basename" == ".gitkeep" ]] && continue
+        has_overview=true
+        break
+      done
+      shopt -u nullglob
+      [[ "$has_overview" == "false" ]] && failures+=("No structural overview map found at maps/ root")
+
+      local has_groups=false
+      shopt -s nullglob
+      for dir in "$maps_dir"/*/; do
+        local dir_name="$(basename "$dir")"
+        [[ "$dir_name" == ".gitkeep" ]] && continue
+        has_groups=true
+        break
+      done
+      shopt -u nullglob
+      [[ "$has_groups" == "false" ]] && failures+=("No group map subdirectories found under maps/")
+    fi
+  fi
+
+  # ── output ─────────────────────────────────────────────────────────
+  if [[ ${#failures[@]} -gt 0 ]]; then
+    divider
+    printf '%s\n' "${BOLD}${R}Check failed:${RESET}"
+    for f in "${failures[@]}"; do
+      printf '  %s %s\n' "${R}✗${RESET}" "$f"
+    done
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+      printf '\n%s\n' "${BOLD}${Y}Warnings:${RESET}"
+      for w in "${warnings[@]}"; do
+        printf '  %s %s\n' "${Y}⚠${RESET}" "$w"
+      done
+    fi
+    printf '\n'
+    exit 1
+  fi
+
+  divider
+  ok "Check passed."
+  if [[ ${#warnings[@]} -gt 0 ]]; then
+    printf '\n%s\n' "${BOLD}${Y}Warnings:${RESET}"
+    for w in "${warnings[@]}"; do
+      printf '  %s %s\n' "${Y}⚠${RESET}" "$w"
+    done
+  fi
+  printf '\n'
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMAND: sync
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_sync() {
+  local repo_root
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+  header "Pilosa — Sync Agents & Skills"
+
+  local agents_src="$repo_root/.agents/agents"
+  local skills_src="$repo_root/.agents/skills"
+
+  if [[ ! -d "$agents_src" ]]; then
+    die "Canonical agents directory not found: $agents_src"
+  fi
+
+  # ── clean stale mirrors ────────────────────────────────────────────
+  info "Cleaning stale mirrors..."
+  rm -rf "$repo_root/.opencode/skills" 2>/dev/null || true
+
+  # ── ensure destination directories ─────────────────────────────────
+  mkdir -p "$repo_root/.opencode/agents"
+  mkdir -p "$repo_root/.claude/agents"
+  mkdir -p "$repo_root/.codex/agents"
+
+  # ── clean existing vendor agent files ──────────────────────────────
+  rm -f "$repo_root/.opencode/agents/"*.md
+  rm -f "$repo_root/.claude/agents/"*.md
+  rm -f "$repo_root/.codex/agents/"*.toml
+
+  # ── sync agent definitions ─────────────────────────────────────────
+  local agent agent_file name description permissions opencode_perms frontmatter
+  local claude_tools canonical perm_part key val count=0 body_content
+
+  toml_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  }
+
+  for canonical in "$agents_src"/*.md; do
+    [[ -f "$canonical" ]] || continue
+    agent_file="$(basename "$canonical")"
+    agent="${agent_file%.md}"
+
+    frontmatter="$(sed -n '/^---$/,/^---$/p' "$canonical" | sed '1d;$d')"
+    name="$(echo "$frontmatter" | sed -n 's/^name: *//p' | head -1)"
+    description="$(sed -n '/^description: |/,/^[a-z]/p' "$canonical" | sed '/^description:/d;/^[a-z]/d' | sed 's/^  //' | tr -s ' ')"
+    [[ -z "$description" ]] && description="$agent"
+
+    permissions=""
+    local in_perm=false
+    while IFS= read -r line; do
+      if $in_perm && [[ "$line" == "---" ]]; then break; fi
+      if [[ "$line" =~ ^permissions: ]]; then in_perm=true; continue; fi
+      if $in_perm; then
+        if [[ "$line" =~ ^[a-z] ]] && ! [[ "$line" =~ ^[[:space:]] ]]; then break; fi
+        [[ "$line" =~ ^[[:space:]]*-[[:space:]] ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*([a-z]+):[[:space:]]*(.*) ]]; then
+          key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+          [[ -z "$value" ]] && value="allow"
+          permissions="$permissions$key: $value, "
+        fi
+      fi
+    done < "$canonical"
+    permissions="${permissions%, }"
+
+    # ── OpenCode agent ──────────────────────────────────────────────
+    opencode_perms=""
+    IFS=',' read -ra perm_parts <<< "$permissions"
+    for part in "${perm_parts[@]}"; do
+      part="${part## }"; part="${part%% }"
+      [[ -z "$part" ]] && continue
+      key="${part%%:*}"; val="${part#*: }"
+      case "$key" in
+        read|grep|glob) opencode_perms="$opencode_perms  $key: $val"$'\n' ;;
+        write) opencode_perms="$opencode_perms  edit: $val"$'\n' ;;
+        move) opencode_perms="$opencode_perms  bash: $val"$'\n' ;;
+      esac
+    done
+
+    body_content="$(awk 'BEGIN{fm=0} /^---$/ && fm < 2 {fm++; next} fm == 2' "$canonical")"
+
+    cat > "$repo_root/.opencode/agents/$agent_file" << OPENCODE_EOF
+---
+name: $name
+description: |
+$(echo "$description" | sed 's/^/  /')
+mode: subagent
+permission:
+$(echo "$opencode_perms" | sed '$d')
+---
+
+$body_content
+OPENCODE_EOF
+
+    # ── Claude agent ─────────────────────────────────────────────────
+    case "$agent" in
+      pilosa-searcher)    claude_tools="Read, Grep, Glob" ;;
+      pilosa-analyst)     claude_tools="Read" ;;
+      pilosa-writer)      claude_tools="Read, Write" ;;
+      pilosa-verifier)    claude_tools="Read, Grep, Glob, Write" ;;
+      pilosa-janitor)     claude_tools="Read, Grep, Glob, Write" ;;
+      pilosa-mapper)      claude_tools="Read, Write" ;;
+      pilosa-serendippo)  claude_tools="Read, Grep, Glob, Write" ;;
+    esac
+
+    cat > "$repo_root/.claude/agents/$agent_file" << CLAUDE_EOF
+---
+name: $name
+description: |
+$(echo "$description" | sed 's/^/  /')
+tools: $claude_tools
+---
+
+$body_content
+CLAUDE_EOF
+
+    cat > "$repo_root/.codex/agents/${agent}.toml" << CODEX_EOF
+name = "$(toml_escape "$name")"
+description = "$(toml_escape "$description")"
+developer_instructions = '''
+$body_content
+'''
+CODEX_EOF
+
+    count=$((count + 1))
+    ok "Synced $agent"
+  done
+
+  # ── sync skills ────────────────────────────────────────────────────
+  for platform in .opencode .claude .codex; do
+    local dest="$repo_root/$platform/skills"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    for skill_dir in "$skills_src"/*/; do
+      [[ -d "$skill_dir" ]] || continue
+      local skill_name="$(basename "$skill_dir")"
+      mkdir -p "$dest/$skill_name"
+      cp "$skill_dir"*.md "$dest/$skill_name/" 2>/dev/null || true
+      if [[ -d "$skill_dir/references" ]]; then
+        mkdir -p "$dest/$skill_name/references"
+        cp "$skill_dir/references/"*.md "$dest/$skill_name/references/" 2>/dev/null || true
+      fi
+    done
+    local skill_count
+    skill_count="$(find "$dest" -name "SKILL.md" | wc -l | tr -d ' ')"
+    ok "Synced $skill_count skills to $platform/skills/"
+  done
+
+  # ── sync CLAUDE.md ──────────────────────────────────────────────────
+  cp "$repo_root/AGENTS.md" "$repo_root/CLAUDE.md"
+  local today
+  today="$(date +%Y-%m-%d)"
+  # Update updated date and add provenance fields in the frontmatter block
+  sed -i.bak \
+    -e 's/^updated:.*/updated: '"$today"'/' \
+    -e '/^updated:/a\'$'\n''generated_by: sync-agents\'$'\n''generated_at: '"$today"''$'\n''processing_status: auto_generated' \
+    "$repo_root/CLAUDE.md" 2>/dev/null || \
+  sed -i '' \
+    -e 's/^updated:.*/updated: '"$today"'/' \
+    -e '/^updated:/a\
+generated_by: sync-agents\
+generated_at: '"$today"'\
+processing_status: auto_generated' \
+    "$repo_root/CLAUDE.md" 2>/dev/null || true
+  rm -f "$repo_root/CLAUDE.md.bak"
+  ok "Synced CLAUDE.md"
+
+  divider
+  ok "Sync complete — $count agents, skills mirrored to 3 platforms."
+  printf '\n'
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WORKSPACE DISCOVERY & CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+PILOSA_CONFIG="${PILOSA_HOME}/config.yaml"
+PILOSA_CACHE="${PILOSA_HOME}/workspace_cache.txt"
+DEFAULT_SCAN_ROOTS=("$HOME/Projects" "$HOME/Work" "$HOME/Documents")
+CACHE_TTL=3600  # 1 hour
+
+# Load config from ~/.pilosa/config.yaml
+load_config() {
+  SCAN_PERMISSION="unknown"
+  SCAN_ROOTS=("${DEFAULT_SCAN_ROOTS[@]}")
+  
+  [[ -f "$PILOSA_CONFIG" ]] || return 0
+  
+  while IFS= read -r line; do
+    if [[ "$line" == scan_permission:* ]]; then
+      SCAN_PERMISSION="${line#scan_permission: }"
+      SCAN_PERMISSION="${SCAN_PERMISSION//\"/}"
+    elif [[ "$line" == scan_roots:* ]]; then
+      # Next lines will be the roots
+      :
+    elif [[ "$line" == "  - "* ]]; then
+      if [[ -z "$SCAN_PERMISSION" ]]; then
+        continue
+      fi
+      local root="${line#  - }"
+      root="${root//\"/}"
+      root="${root//\~/$HOME}"
+      SCAN_ROOTS+=("$root")
+    fi
+  done < "$PILOSA_CONFIG"
+  
+  # Set defaults if not found
+  [[ -z "$SCAN_PERMISSION" ]] && SCAN_PERMISSION="unknown" || true
+  [[ ${#SCAN_ROOTS[@]} -eq 0 ]] && SCAN_ROOTS=("${DEFAULT_SCAN_ROOTS[@]}") || true
+}
+
+# Save config to ~/.pilosa/config.yaml
+save_config() {
+  local permission="${1:-unknown}"
+  shift
+  local roots=("$@")
+  
+  mkdir -p "$PILOSA_HOME"
+  
+  {
+    echo "scan_permission: \"$permission\""
+    echo "scan_roots:"
+    for root in "${roots[@]}"; do
+      echo "  - \"$root\""
+    done
+  } > "$PILOSA_CONFIG"
+}
+
+# Ask permission on first run
+ask_scan_permission() {
+  printf '\n%s\n' "${BOLD}Pilosa needs to discover your workspaces.${RESET}"
+  printf '\n%s\n' "Scan common directories (~/Projects, ~/Work, ~/Documents) for Pilosa workspaces?"
+  printf '%s\n' "This runs \`find\` with maxdepth 3 and caches results for 1 hour."
+  printf '\n'
+  
+  if confirm "Allow workspace discovery?" "y"; then
+    save_config "granted" "${DEFAULT_SCAN_ROOTS[@]}"
+    return 0
+  else
+    save_config "denied" "${DEFAULT_SCAN_ROOTS[@]}"
+    return 1
+  fi
+}
+
+# Check if cache is fresh (< TTL)
+cache_is_fresh() {
+  [[ -f "$PILOSA_CACHE" ]] || return 1
+  
+  local cache_time
+  cache_time="$(stat -f %m "$PILOSA_CACHE" 2>/dev/null || stat -c %Y "$PILOSA_CACHE" 2>/dev/null || echo 0)"
+  local current_time
+  current_time="$(date +%s)"
+  local age=$((current_time - cache_time))
+  
+  [[ $age -lt $CACHE_TTL ]]
+}
+
+# Scan workspaces and return paths
+scan_workspaces() {
+  local roots=("$@")
+  local seen=()
+  
+  # Handle empty roots array
+  [[ ${#roots[@]} -gt 0 ]] || return 0
+  
+  for root in "${roots[@]}"; do
+    [[ -d "$root" ]] || continue
+    while IFS= read -r -d '' ws_file; do
+      local ws_dir
+      ws_dir="$(cd "$(dirname "$(dirname "$ws_file")")" && pwd)"
+      local already_seen=0
+      for s in "${seen[@]}"; do
+        [[ "$s" == "$ws_dir" ]] && { already_seen=1; break; }
+      done
+      [[ "$already_seen" == "0" ]] || continue
+      seen+=("$ws_dir")
+      printf '%s\n' "$ws_dir"
+    done < <(find "$root" -maxdepth 3 -name "workspace" -path "*/.pilosa/workspace" -print0 2>/dev/null)
+  done
+}
+
+# Update cache with discovered workspaces
+update_cache() {
+  local workspaces=("$@")
+  
+  mkdir -p "$PILOSA_HOME"
+  
+  {
+    for ws in "${workspaces[@]}"; do
+      local project
+      project="$(grep 'project_name:' "$ws/.pilosa/workspace" 2>/dev/null | sed 's/project_name: *//' | head -1)"
+      echo "$ws|$project"
+    done
+  } > "$PILOSA_CACHE"
+}
+
+# Load workspaces from cache
+load_cached_workspaces() {
+  [[ -f "$PILOSA_CACHE" ]] || return 1
+  
+  while IFS='|' read -r path project; do
+    [[ -d "$path/.pilosa" ]] || continue  # Validate still exists
+    printf '%s|%s\n' "$path" "$project"
+  done < "$PILOSA_CACHE"
+}
+
+# Main discovery function with permission and caching
+# Note: This function does NOT ask for permission - caller must handle that
+discover_workspaces_with_permission() {
+  load_config
+  
+  # Check permission (don't ask, just check)
+  if [[ "$SCAN_PERMISSION" != "granted" ]]; then
+    return 1
+  fi
+  
+  # Try registry first (instant)
+  if load_registry; then
+    return 0
+  fi
+  
+  # Fallback to scan
+  local workspaces=()
+  while IFS= read -r ws; do
+    [[ -n "$ws" ]] && workspaces+=("$ws")
+  done < <(scan_workspaces "${SCAN_ROOTS[@]}")
+  
+  # Update both cache and registry (only if workspaces found)
+  if [[ ${#workspaces[@]} -gt 0 ]]; then
+    update_cache "${workspaces[@]}"
+    update_registry "${workspaces[@]}"
+  fi
+  
+  # Return results
+  if [[ ${#workspaces[@]} -gt 0 ]]; then
+    for ws in "${workspaces[@]}"; do
+      local project
+      project="$(grep 'project_name:' "$ws/.pilosa/workspace" 2>/dev/null | sed 's/project_name: *//' | head -1)"
+      printf '%s|%s\n' "$ws" "$project"
+    done
+  fi
+}
+
+# Load workspaces from persistent registry
+load_registry() {
+  local registry="${PILOSA_HOME}/workspaces.txt"
+  [[ -f "$registry" ]] || return 1
+  
+  local found=0
+  while IFS='|' read -r path project created; do
+    [[ -d "$path/.pilosa" ]] || continue  # Validate still exists
+    printf '%s|%s\n' "$path" "$project"
+    found=1
+  done < "$registry"
+  
+  [[ $found -eq 1 ]]
+}
+
+# Register a workspace in the persistent registry
+register_workspace() {
+  local path="$1"
+  local project="${2:-}"
+  local registry="${PILOSA_HOME}/workspaces.txt"
+  
+  mkdir -p "$PILOSA_HOME"
+  
+  # Remove if already exists
+  if [[ -f "$registry" ]]; then
+    grep -v "^${path}|" "$registry" > "${registry}.tmp" 2>/dev/null || true
+    mv "${registry}.tmp" "$registry"
+  fi
+  
+  # Add new entry
+  echo "${path}|${project}|$(date +%Y-%m-%d)" >> "$registry"
+}
+
+# Update registry with discovered workspaces
+update_registry() {
+  local workspaces=("$@")
+  local registry="${PILOSA_HOME}/workspaces.txt"
+  
+  mkdir -p "$PILOSA_HOME"
+  
+  for ws in "${workspaces[@]}"; do
+    local project
+    project="$(grep 'project_name:' "$ws/.pilosa/workspace" 2>/dev/null | sed 's/project_name: *//' | head -1)"
+    # Only add if not already in registry
+    if ! grep -q "^${ws}|" "$registry" 2>/dev/null; then
+      echo "${ws}|${project}|$(date +%Y-%m-%d)" >> "$registry"
+    fi
+  done
+}
+
+# Legacy function for backward compatibility
+discover_workspaces() {
+  discover_workspaces_with_permission | cut -d'|' -f1
+}
+
+# Validate workspace path
+validate_workspace() {
+  local path="$1"
+  [[ -d "$path" ]] || return 1
+  [[ -f "$path/.pilosa/workspace" ]] || return 1
+  return 0
+}
+
+# Prompt for workspace path with escape option
+prompt_workspace_or_cancel() {
+  local hint="(Enter workspace path, Esc to go back)"
+  while true; do
+    local manual_path
+    manual_path="$(prompt_input "Workspace path" "" "$hint")"
+    # Esc → cancel
+    [[ "$manual_path" != $'\e'* ]] || return 1
+    [[ -n "$manual_path" ]] || continue
+    manual_path="$(expand_home "$manual_path")"
+    if ! validate_workspace "$manual_path"; then
+      printf '%s\n' "${R}Not a valid Pilosa workspace: $manual_path${RESET}" >&2
+      continue
+    fi
+    echo "$manual_path"
+    return 0
+  done
+}
+
+# Main helper - returns workspace path or prompts for selection
+require_workspace() {
+  local provided_path="${1:-}"
+  
+  # If path provided, validate it
+  if [[ -n "$provided_path" ]]; then
+    provided_path="$(expand_home "$provided_path")"
+    if validate_workspace "$provided_path"; then
+      echo "$provided_path"
+      return 0
+    else
+      die "Not a valid Pilosa workspace: $provided_path"
+    fi
+  fi
+  
+  # Check if current directory is a workspace
+  if validate_workspace "$(pwd)"; then
+    echo "$(pwd)"
+    return 0
+  fi
+  
+  # Not in a workspace - discover and prompt
+  printf '\n%s\n' "${Y}Not in a Pilosa workspace.${RESET}" >&2
+  local discovered=()
+  local workspace_data
+  
+  spinner_start "Discovering workspaces"
+  workspace_data="$(discover_workspaces_with_permission 2>/dev/null)"
+  spinner_stop
+  
+  if [[ -z "$workspace_data" ]]; then
+    # Discovery failed or denied - prompt for path
+    prompt_workspace_or_cancel || return 1
+    return 0
+  fi
+  
+  # Parse discovered workspaces
+  while IFS='|' read -r ws_path project; do
+    [[ -n "$ws_path" ]] && discovered+=("$ws_path|$project")
+  done <<< "$workspace_data"
+  
+  if [[ ${#discovered[@]} -eq 0 ]]; then
+    # No valid workspaces - prompt for path
+    prompt_workspace_or_cancel || return 1
+    return 0
+  fi
+  
+  # Build options for selection
+  local options=()
+  for entry in "${discovered[@]}"; do
+    local ws_path="${entry%%|*}"
+    local project="${entry#*|}"
+    local ws_name
+    ws_name="$(basename "$ws_path")"
+    
+    if [[ -n "$project" ]]; then
+      options+=("$(option_spec "$ws_path" "$ws_name" "$project")")
+    else
+      options+=("$(option_spec "$ws_path" "$ws_path" "")")
+    fi
+  done
+  options+=("$(option_spec "__scan__" "Find other workspaces" "scan directories for workspaces")")
+  options+=("$(option_spec "__enter__" "Enter path manually" "type a workspace path")")
+  
+  local choice
+  choice="$(prompt_choose "Select a workspace" "${options[@]}")" || return 1
+  
+  if [[ "$choice" == "__scan__" ]]; then
+    spinner_start "Scanning for workspaces"
+    local scanned=()
+    while IFS= read -r ws; do
+      [[ -n "$ws" ]] && scanned+=("$ws")
+    done < <(scan_workspaces "${SCAN_ROOTS[@]}")
+    spinner_stop
+    
+    local new_count=0
+    for ws in "${scanned[@]}"; do
+      if ! grep -q "^${ws}|" "${PILOSA_HOME}/workspaces.txt" 2>/dev/null; then
+        new_count=$((new_count + 1))
+      fi
+    done
+    
+    update_registry "${scanned[@]}"
+    
+    if [[ $new_count -gt 0 ]]; then
+      ok "Found ${new_count} new workspace(s), registry updated"
+    else
+      info "No new workspaces found"
+    fi
+    
+    # Re-prompt with updated list
+    exec "$0" "${BASH_ARGV[@]}"
+  elif [[ "$choice" == "__enter__" ]]; then
+    local manual_path
+    manual_path="$(prompt_input "Workspace path")"
+    [[ -n "$manual_path" ]] || die "Path is required"
+    manual_path="$(expand_home "$manual_path")"
+    if ! validate_workspace "$manual_path"; then
+      die "Not a valid Pilosa workspace: $manual_path"
+    fi
+    echo "$manual_path"
+  else
+    echo "$choice"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_health() {
+  header "Pilosa — System Health"
+  local issues=0
+
+  if [[ -n "$FRAMEWORK_ROOT" ]]; then
+    ok "Framework found: ${FRAMEWORK_ROOT}"
+  else
+    warn "Framework not found — is Pilosa installed?"
+    issues=$((issues + 1))
+  fi
+
+  if gum_available; then
+    ok "Gum available"
+  else
+    note "Gum not available — plain prompts will be used"
+  fi
+
+  if rapidocr_ocr_available; then
+    ok "RapidOCR OCR available for PDFs and images"
+  else
+    note "RapidOCR OCR not bundled — PDFs and images will be skipped"
+  fi
+
+  local ws_count
+  spinner_start "Discovering workspaces"
+  local workspace_data
+  workspace_data="$(discover_workspaces_with_permission 2>/dev/null)"
+  if [[ -n "$workspace_data" ]]; then
+    ws_count="$(echo "$workspace_data" | wc -l | tr -d ' ')"
+  else
+    ws_count=0
+  fi
+  spinner_stop
+  if [[ "$ws_count" -gt 0 ]]; then
+    ok "${ws_count} workspace(s) discovered"
+  else
+    note "No workspaces discovered yet"
+  fi
+
+  local cli_count=0
+  command -v claude >/dev/null 2>&1 && cli_count=$((cli_count + 1))
+  command -v codex >/dev/null 2>&1 && cli_count=$((cli_count + 1))
+  command -v opencode >/dev/null 2>&1 && cli_count=$((cli_count + 1))
+  ok "${cli_count} LLM CLI(s) detected"
+
+  divider
+  if [[ "$issues" -gt 0 ]]; then
+    warn "${issues} issue(s) found"
+  else
+    ok "System health check passed"
+  fi
+  echo ""
+}
+
+
+
+# Fetch release notes from GitHub API
+fetch_release_notes() {
+  local version="${1:-latest}"
+  local api_url
+  
+  if [[ "$version" == "latest" ]]; then
+    api_url="https://api.github.com/repos/${PILOSA_REPO}/releases/latest"
+  else
+    api_url="https://api.github.com/repos/${PILOSA_REPO}/releases/tags/v${version}"
+  fi
+  
+  # Use Python for reliable JSON parsing
+  curl -fsSL "$api_url" 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    tag = data.get('tag_name', '')
+    published = data.get('published_at', '').replace('T', ' ').replace('Z', '')
+    body = data.get('body', '')
+    print(f'{tag}|{published}|{body}')
+except:
+    pass
+" 2>/dev/null
+}
+
+# Display release notes in a formatted way
+display_release_notes() {
+  local release_data="$1"
+  local tag_name published_at body
+  
+  tag_name="$(echo "$release_data" | cut -d'|' -f1)"
+  published_at="$(echo "$release_data" | cut -d'|' -f2)"
+  body="$(echo "$release_data" | cut -d'|' -f3-)"
+  
+  # Truncate body to first 3 non-empty lines
+  local short_body=""
+  local line_count=0
+  if [[ -n "$body" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      line_count=$((line_count + 1))
+      [[ "$line_count" -le 3 ]] && short_body+="${line}"$'\n'
+      [[ "$line_count" -ge 3 ]] && break
+    done <<< "$body"
+  fi
+
+  printf '\n'
+  if [[ -n "$short_body" ]]; then
+    note "${BOLD}${tag_name}${RESET} — $(echo "$short_body" | head -1)"
+    local extra
+    extra="$(echo "$short_body" | tail -n +2 | sed '/^$/d')"
+    [[ -n "$extra" ]] && echo "$extra" | while IFS= read -r l; do note "  $l"; done
+  else
+    note "${BOLD}${tag_name}${RESET}"
+  fi
+  echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMAND: upgrade
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_upgrade() {
+  local target_version="latest"
+  local auto_yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --version) target_version="$2"; shift 2 ;;
+      --yes|-y) auto_yes=1; shift ;;
+      --help|-h)
+        printf '  %s\n' "Usage: pilosa upgrade [options]"
+        printf '    %s\n' "  --version X.Y.Z   Upgrade to specific version (default: latest)"
+        printf '    %s\n' "  --yes             Skip confirmation prompt"
+        printf '    %s\n' "  --help            Show this help"
+        return 0
+        ;;
+      -*) die "Unknown option: $1" ;;
+      *) shift ;;
+    esac
+  done
+
+  header "Pilosa — Upgrade"
+
+  # Fetch and display release notes before confirmation
+  if [[ "$auto_yes" -ne 1 ]]; then
+    spinner_start "Fetching release notes"
+    local release_data
+    release_data="$(fetch_release_notes "$target_version")"
+    spinner_stop
+    
+    if [[ -n "$release_data" ]]; then
+      display_release_notes "$release_data"
+    else
+      warn "Could not fetch release notes"
+      printf '\n'
+    fi
+  fi
+
+  # Confirm before downloading and running installer
+  if [[ "$auto_yes" -ne 1 ]]; then
+    if ! confirm "Download and run the Pilosa installer to upgrade?" "y"; then
+      info "Upgrade cancelled."
+      return 0
+    fi
+  fi
+
+  info "Downloading latest installer..."
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  local installer="${tmpdir}/install-pilosa.sh"
+
+  # Resolve latest version from GitHub
+  spinner_start "Resolving latest version"
+  local latest_version
+  latest_version="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/${PILOSA_REPO}/releases/latest" 2>/dev/null | sed 's|.*/tag/v||' || echo "")"
+  spinner_stop
+  
+  if [[ -n "$latest_version" ]]; then
+    spinner_start "Downloading installer v${latest_version}"
+    if ! curl -fsSL "https://github.com/${PILOSA_REPO}/releases/download/v${latest_version}/install.sh" -o "$installer" 2>/dev/null; then
+      spinner_stop
+      warn "Could not download release installer. Falling back to raw main branch..."
+      spinner_start "Downloading from main branch"
+      curl -fsSL "https://raw.githubusercontent.com/${PILOSA_REPO}/main/install.sh" -o "$installer" || die "Could not download installer"
+    fi
+    spinner_stop
+  else
+    spinner_start "Downloading from main branch"
+    curl -fsSL "https://raw.githubusercontent.com/${PILOSA_REPO}/main/install.sh" -o "$installer" || die "Could not download installer"
+    spinner_stop
+  fi
+
+  ok "Installer downloaded"
+
+  local upgrade_args=("--upgrade")
+  if [[ "$target_version" != "latest" ]]; then
+    upgrade_args+=("--version" "$target_version")
+  fi
+  if [[ "$auto_yes" -eq 1 ]]; then
+    upgrade_args+=("--yes")
+  fi
+
+  bash "$installer" "${upgrade_args[@]}"
+
+  rm -rf "$tmpdir"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMAND: dashboard
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_dashboard() {
+  local version
+  version="$(framework_version "$FRAMEWORK_ROOT")"
+  [[ -z "$version" || "$version" == "dev" ]] && version="dev"
+  local in_workspace=0
+  local project_name="" setup_status="" fw_version=""
+  local discovered_workspaces=()
+  local cli_labels=()
+
+  header "Pilosa — Research Framework"
+  printf '  %s v%s%s\n\n' "${BOLD}" "$version" "${RESET}"
+
+  # ── Workspace context ─────────────────────────────────────────────────
+  if [[ -f ".pilosa/workspace" ]]; then
+    in_workspace=1
+    project_name="$(grep 'project_name:' .pilosa/workspace 2>/dev/null | sed 's/project_name: *//' | head -1)"
+    setup_status="$(grep 'setup_status:' .pilosa/workspace 2>/dev/null | sed 's/setup_status: *//' | head -1)"
+    fw_version="$(grep 'framework_version:' .pilosa/workspace 2>/dev/null | sed 's/framework_version: *//' | head -1)"
+  fi
+
+  if [[ "$in_workspace" -eq 1 ]]; then
+    printf '  %sWorkspace:%s %s\n' "${BOLD}" "${RESET}" "${project_name:-unknown}"
+    printf '  %sStatus:%s    %s\n' "${BOLD}" "${RESET}" "${setup_status:-unknown}"
+    printf '  %sFramework:%s v%s\n' "${BOLD}" "${RESET}" "${fw_version:-unknown}"
+  else
+    # Discover workspaces with permission and caching
+    # First check if we need permission (without spinner)
+    load_config
+    if [[ "$SCAN_PERMISSION" == "unknown" ]]; then
+      # Need to ask permission - do it without spinner
+      if ! ask_scan_permission; then
+        info "Workspace discovery denied. You can manually specify workspace paths."
+      else
+        load_config  # Reload after saving
+      fi
+    fi
+    
+    # Now discover workspaces with spinner
+    if [[ "$SCAN_PERMISSION" == "granted" ]]; then
+      spinner_start "Discovering workspaces"
+      local workspace_data
+      workspace_data="$(discover_workspaces_with_permission 2>/dev/null)"
+      spinner_stop
+    else
+      local workspace_data=""
+    fi
+    
+    if [[ -n "$workspace_data" ]]; then
+      while IFS='|' read -r ws_path project; do
+        [[ -n "$ws_path" ]] && discovered_workspaces+=("$ws_path|$project")
+      done <<< "$workspace_data"
+    fi
+
+    if [[ ${#discovered_workspaces[@]} -gt 0 ]]; then
+      printf '  %sDiscovered workspaces:%s %d\n' "${BOLD}" "${RESET}" "${#discovered_workspaces[@]}"
+      local i entry ws_path project ws_name
+      for i in "${!discovered_workspaces[@]}"; do
+        entry="${discovered_workspaces[$i]}"
+        ws_path="${entry%%|*}"
+        project="${entry#*|}"
+        ws_name="$(basename "$ws_path")"
+        if [[ $i -lt 3 ]]; then
+          if [[ -n "$project" ]]; then
+            printf '    %s %s %s(%s)%s\n' "${DIM}•${RESET}" "$ws_name" "${DIM}" "$project" "${RESET}"
+          else
+            printf '    %s %s\n' "${DIM}•${RESET}" "$ws_name"
+          fi
+        fi
+      done
+      if [[ ${#discovered_workspaces[@]} -gt 3 ]]; then
+        printf '    %s ... and %d more\n' "${DIM}" "$((${#discovered_workspaces[@]} - 3))"
+      fi
+    else
+      printf '  %sNo workspaces yet — start with New workspace%s\n' "${DIM}" "${RESET}"
+    fi
+  fi
+
+  printf '\n'
+
+  # ── LLM CLIs ──────────────────────────────────────────────────────────
+  spinner_start "Detecting LLM CLIs"
+  local cli_output
+  cli_output="$(detect_llm_clis)"
+  spinner_stop
+  if [[ -n "$cli_output" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && cli_labels+=("$line")
+    done <<< "$cli_output"
+  fi
+
+  if [[ ${#cli_labels[@]} -gt 0 ]]; then
+    printf '  %sLLM CLIs:%s ' "${BOLD}" "${RESET}"
+    local i
+    for i in "${!cli_labels[@]}"; do
+      if [[ $i -gt 0 ]]; then
+        printf ', '
+      fi
+      printf '%s %s' "${G}✓${RESET}" "${cli_labels[$i]}"
+    done
+    printf '\n'
+  fi
+
+  printf '\n'
+  divider
+  printf '\n'
+
+  # ── Menu ──────────────────────────────────────────────────────────────
+  while true; do
+    local options=()
+    options+=("$(option_spec "new" "New workspace" "Create a new workspace and run onboarding")")
+    options+=("$(option_spec "onboard" "Onboard workspace" "Run onboarding on an existing workspace")")
+    options+=("$(option_spec "update" "Update workspace" "Update workspace framework files")")
+    options+=("$(option_spec "check" "Check workspace" "Validate workspace integrity")")
+    options+=("$(option_spec "sync" "Sync agents" "Sync agent and skill mirrors")")
+    options+=("$(option_spec "upgrade" "Upgrade Pilosa" "Upgrade to latest release")")
+    options+=("$(option_spec "health" "System health" "Check system health and environment")")
+    options+=("$(option_spec "uninstall" "Uninstall" "Remove Pilosa from this system")")
+    options+=("$(option_spec "help" "Help" "Show help information")")
+
+    local choice
+    choice="$(prompt_choose "What would you like to do?" "${options[@]}")" || return 0
+
+    printf '\n'
+
+    case "$choice" in
+      new)       cmd_new "$@" || true ;;
+      onboard)   cmd_onboard "$@" || true ;;
+      update)    cmd_update "$@" || true ;;
+      check)     cmd_check "$@" || true ;;
+      sync)      cmd_sync || true ;;
+      upgrade)   cmd_upgrade || true ;;
+      health)    cmd_health || true ;;
+      uninstall) cmd_uninstall "$@" || true ;;
+      help)      cmd_help || true ;;
+      *)         return 0 ;;
+    esac
+
+    printf '\n'
+  done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+case "${1:-}" in
+  new)       shift; cmd_new "$@" || true ;;
+  onboard)   shift; cmd_onboard "$@" || true ;;
+  update)    shift; cmd_update "$@" || true ;;
+  upgrade)   shift; cmd_upgrade "$@" || true ;;
+  check)     shift; cmd_check "$@" || true ;;
+  sync)      shift; cmd_sync || true ;;
+  health)    shift; cmd_health || true ;;
+  uninstall) shift; cmd_uninstall "$@" || true ;;
+  help|-h|--help) cmd_help ;;
+  "") cmd_dashboard ;;
+  *)
+    printf '%s\n' "${R}Unknown command: $1${RESET}" >&2
+    cmd_help
+    exit 1
+    ;;
+esac
+
+
